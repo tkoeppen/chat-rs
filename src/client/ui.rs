@@ -35,6 +35,13 @@ pub struct UiState {
     pub addr: SocketAddr,
     pub input: String,
     pub messages: VecDeque<DisplayMsg>,
+    /// Number of messages below the bottom of the visible window.
+    /// `0` means pinned to the latest message; positive values mean the
+    /// user has scrolled back into history.
+    pub scroll: usize,
+    /// Inner height of the room pane (excluding borders) as of the last
+    /// render. Used by paging keys; updated by `render`.
+    pub last_inner_h: usize,
 }
 
 pub struct DisplayMsg {
@@ -61,14 +68,24 @@ impl UiState {
             addr,
             input: String::new(),
             messages: VecDeque::with_capacity(HISTORY_CAP),
+            scroll: 0,
+            last_inner_h: 0,
         }
     }
 
     pub fn push(&mut self, msg: DisplayMsg) {
-        if self.messages.len() == HISTORY_CAP {
+        let was_capped = self.messages.len() == HISTORY_CAP;
+        if was_capped {
             self.messages.pop_front();
         }
         self.messages.push_back(msg);
+        // If the user is reading history, anchor their view to the same
+        // historical position by incrementing scroll. (When the deque is
+        // capped, len doesn't change so we don't need to bump.)
+        if self.scroll > 0 && !was_capped {
+            self.scroll += 1;
+        }
+        self.clamp_scroll();
     }
 
     pub fn push_system(&mut self, text: impl Into<String>) {
@@ -76,6 +93,35 @@ impl UiState {
             ts_ms: now_ms(),
             kind: DisplayKind::System { text: text.into() },
         });
+    }
+
+    pub fn clear_messages(&mut self) {
+        self.messages.clear();
+        self.scroll = 0;
+    }
+
+    pub fn scroll_up(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_add(n);
+        self.clamp_scroll();
+    }
+
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    pub fn scroll_to_latest(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_to_oldest(&mut self) {
+        self.scroll = self.messages.len().saturating_sub(self.last_inner_h.max(1));
+    }
+
+    pub fn clamp_scroll(&mut self) {
+        let max = self.messages.len().saturating_sub(self.last_inner_h.max(1));
+        if self.scroll > max {
+            self.scroll = max;
+        }
     }
 }
 
@@ -107,7 +153,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn render(f: &mut ratatui::Frame, state: &UiState) {
+pub fn render(f: &mut ratatui::Frame, state: &mut UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -129,22 +175,33 @@ pub fn render(f: &mut ratatui::Frame, state: &UiState) {
     f.render_widget(header, chunks[0]);
 
     let status = Paragraph::new(format!(
-        " {} · {}  —  enter to send · /clear · ctrl-c to quit",
+        " {} · {}  —  enter · /clear · ↑↓/PgUp/PgDn scroll · End live · ctrl-c quit",
         state.username, state.addr,
     ))
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     f.render_widget(status, chunks[1]);
 
     let inner_h = chunks[2].height.saturating_sub(2) as usize;
+    state.last_inner_h = inner_h;
+    state.clamp_scroll();
+
+    let len = state.messages.len();
+    let end = len.saturating_sub(state.scroll);
+    let start = end.saturating_sub(inner_h);
     let visible: Vec<ListItem> = state
         .messages
         .iter()
-        .rev()
-        .take(inner_h)
-        .rev()
+        .skip(start)
+        .take(end - start)
         .map(|m| ListItem::new(format_line(m)))
         .collect();
-    let messages = List::new(visible).block(Block::default().borders(Borders::ALL).title(" room "));
+
+    let title = if state.scroll > 0 {
+        format!(" room (↑ scrolled {} — End to return) ", state.scroll)
+    } else {
+        " room ".to_string()
+    };
+    let messages = List::new(visible).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(messages, chunks[2]);
 
     let input = Paragraph::new(state.input.as_str())
@@ -239,6 +296,32 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
         }
         KeyCode::Backspace => {
             state.input.pop();
+            KeyAction::None
+        }
+        KeyCode::Up => {
+            state.scroll_up(1);
+            KeyAction::None
+        }
+        KeyCode::Down => {
+            state.scroll_down(1);
+            KeyAction::None
+        }
+        KeyCode::PageUp => {
+            let step = state.last_inner_h.saturating_sub(1).max(1);
+            state.scroll_up(step);
+            KeyAction::None
+        }
+        KeyCode::PageDown => {
+            let step = state.last_inner_h.saturating_sub(1).max(1);
+            state.scroll_down(step);
+            KeyAction::None
+        }
+        KeyCode::Home => {
+            state.scroll_to_oldest();
+            KeyAction::None
+        }
+        KeyCode::End => {
+            state.scroll_to_latest();
             KeyAction::None
         }
         KeyCode::Char(c) => {

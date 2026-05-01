@@ -2,18 +2,19 @@
 
 Encrypted terminal chat in Rust. Single binary; runs as either server or client. Zero persistence, zero plaintext on the wire, zero secrets on disk.
 
-This spec is **not** wire-compatible with the Python `cmd-chat` references. They informed the UX (CLI shape, broadcast semantics, history-on-join) but their crypto stack (SRP + Fernet + JSON) is replaced with a stronger, smaller, modern alternative.
+This spec is **not** wire-compatible with the Python `cmd-chat` references. They informed the UX (broadcast semantics, history-on-join, `/clear`) but their crypto stack (SRP + Fernet + JSON) is replaced with a stronger, smaller, modern alternative.
+
+For the in-flight checklist, see [`01-TODO.md`](01-TODO.md). This document is the design — what the code *is*. The TODO is what's left to do.
 
 ## Goals
 
 - Strongest practical crypto with the fewest moving parts.
 - Audited primitives only — no hand-rolled handshakes or AEAD.
-- One small binary; minimal dependency tree.
-- Forward secrecy per connection. Server never observes plaintext or password-equivalents.
+- One small binary; minimal direct dependency tree.
+- Forward secrecy at the transport layer. Server never observes plaintext or password-equivalents.
 
 ## Non-goals
 
-- Wire compatibility with Python `cmd-chat`.
 - Persistent message history.
 - User registration, accounts, federation.
 - TLS termination in-process (run behind a reverse proxy if needed).
@@ -22,12 +23,12 @@ This spec is **not** wire-compatible with the Python `cmd-chat` references. They
 
 ## CLI
 
-```
-chat-rs serve   <ip> <port> --password <pw>
-chat-rs connect <ip> <port> <username> <password>
+```sh
+chat-rs serve   <ip> <port>
+chat-rs connect <ip> <port> <username>
 ```
 
-No env-var config. Mirrors the Python CLI for muscle memory.
+The password is read from the `CHAT_RS_PASSWORD` environment variable if set, otherwise from an interactive prompt (`rpassword`, no echo). There is **no** `--password` flag — passwords on the command line leak into shell history and `ps`.
 
 ## Cryptographic design
 
@@ -38,9 +39,10 @@ No env-var config. Mirrors the Python CLI for muscle memory.
 | Password stretching | Argon2id (m=64 MiB, t=3, p=1, len=32) | `argon2` |
 | Authenticated key exchange | Noise NNpsk0 — X25519 + ChaCha20-Poly1305 + BLAKE2s | `snow` |
 | Room-level AEAD | XChaCha20-Poly1305 (24-byte random nonce) | `chacha20poly1305` |
-| Key separation | HKDF-SHA256 (single tiny use, see below) | `hkdf` + `sha2` *(optional — could fold into `snow`'s mix-key API)* |
-| Constant-time compare | `subtle` *(transitive, not a direct dep)* | — |
-| Zeroization | `zeroize` (derive on key types) | `zeroize` |
+| Master-key splitting (KDF) | Keyed BLAKE2s-256 (`Blake2sMac256`) | `blake2` |
+| Constant-time compare | `subtle` *(transitive via AEAD/argon2; not a direct dep)* | — |
+| Zeroization | `Zeroizing<T>` + `#[derive(Zeroize, ZeroizeOnDrop)]` | `zeroize` |
+| Random | OS RNG via `getrandom::fill` | `getrandom` |
 
 ### Connection setup
 
@@ -48,7 +50,7 @@ Two phases: one plaintext server-hello frame, then a Noise NNpsk0 handshake.
 
 **Phase 0 — Server hello (plaintext):**
 
-Server sends a single length-prefixed frame: `postcard(ServerFrame::Hello { room_salt, server_version })`. `room_salt` is non-secret (a stretching salt, not a key), so sending it in the clear is fine — and it avoids the chicken-and-egg of needing `room_salt` to derive the PSK *before* the Noise handshake begins.
+Server sends a single length-prefixed frame: `postcard(ServerFrame::Hello { room_salt, server_version })`. `room_salt` is non-secret (an Argon2 stretching salt, not a key), so sending it in the clear is fine — and it avoids the chicken-and-egg of needing `room_salt` to derive the PSK *before* the Noise handshake begins.
 
 The server generates `room_salt` once at startup (32 random bytes) and reuses it for the process lifetime. Restarting the server rotates the salt, which forces every client to re-stretch its password.
 
@@ -58,11 +60,13 @@ Once the client has `room_salt` from the server hello:
 
 ```
 master   = Argon2id(password, room_salt, m=64 MiB, t=3, p=1, len=32)
-psk      = HKDF-SHA256(master, info = b"chat-rs/v1/psk",  len = 32)
-room_key = HKDF-SHA256(master, info = b"chat-rs/v1/room", len = 32)
+psk      = Blake2sMac256(key=master, msg=b"chat-rs/v1/psk")     // 32 bytes
+room_key = Blake2sMac256(key=master, msg=b"chat-rs/v1/room")    // 32 bytes
 ```
 
-`master` is zeroized immediately after expansion. `psk` is consumed by the Noise handshake. `room_key` lives for the connection lifetime in a `Zeroizing<[u8; 32]>`.
+Keyed BLAKE2s-256 is used as a one-shot KDF: distinct labels yield independent 32-byte keys from the same master. `master` is zeroized immediately after expansion (it lives in `Zeroizing<[u8; 32]>`). `psk` is consumed by the Noise handshake. `room_key` lives for the connection lifetime in a `Zeroizing<[u8; 32]>`.
+
+The server precomputes its `psk` once at startup (in `ServerState::new`), drops the password, and stores only the `psk` — so an unauthenticated TCP connect cannot trigger any Argon2 work.
 
 ### Handshake — Phase 1 — Noise NNpsk0
 
@@ -77,7 +81,7 @@ client ◄─ M1 = e, ee, transport(empty payload) ── server
 Both sides call `Builder::psk(0, &psk)` before the handshake. After M1, transport keys are ready and either side can send. Properties:
 
 - Mutual authentication via the PSK (anyone without the password fails to derive matching transport keys; the first ciphertext fails its tag check and the connection drops).
-- Forward secrecy via ephemeral X25519 on both sides.
+- Forward secrecy via ephemeral X25519 on both sides (per-connection only; the room-level key is not yet ratcheted — see Open questions).
 - Server identity not pinned — the password *is* the shared secret. (XKpsk3 with a server static key is a future option if cross-server identity becomes useful.)
 
 ### Frame format
@@ -88,7 +92,7 @@ Inner (after Noise transport decrypt): `postcard`-encoded enum.
 
 ```rust
 enum ClientFrame {
-    Hello { username: String },
+    Hello { username: String },                       // username capped at MAX_USERNAME_LEN = 32
     Message { ad: MessageAd, ciphertext: Vec<u8> },   // XChaCha20-Poly1305 over room_key
     Clear,
 }
@@ -101,13 +105,7 @@ enum ServerFrame {
     Error   { reason: ErrorKind },
 }
 
-enum ErrorKind {
-    AuthFailed,
-    BadFrame,
-    RateLimited,
-    UnsupportedVersion,
-    Internal,
-}
+enum ErrorKind { AuthFailed, BadFrame, RateLimited, UnsupportedVersion, Internal }
 
 struct RoomMessage {
     from: Uuid,
@@ -119,7 +117,7 @@ struct RoomMessage {
 struct MessageAd { from: Uuid, timestamp_ms: u64 }
 ```
 
-The server **never** decrypts `ciphertext` — it only forwards it and tracks ordering / history. Sender identity (`from`) and timestamp are bound to the ciphertext via AEAD additional data, so a malicious server cannot relabel messages without breaking decryption.
+The server **never** decrypts `ciphertext` — it only forwards it and tracks ordering / history. Sender identity (`from`) and timestamp are bound to the ciphertext via AEAD additional data, so a malicious server cannot relabel `from` without breaking decryption. The server enforces `ad.from == session user_id` on receive: misbehaving clients are rejected with `Protocol`, not silently overwritten.
 
 ### Room encryption
 
@@ -138,90 +136,129 @@ ciphertext = XChaCha20Poly1305::seal(room_key, nonce, plaintext, ad)
 2. Server sends `ServerFrame::Hello { room_salt, server_version }` (plaintext, length-prefixed).
 3. Client stretches password → `master`, splits → `psk` + `room_key`. If `server_version` is incompatible the client closes immediately.
 4. Noise NNpsk0 handshake (M0 from client, M1 from server). Wrong PSK → AEAD tag fails on first transport message → both sides close.
-5. Client sends `ClientFrame::Hello { username }` (Noise-encrypted).
+5. Client sends `ClientFrame::Hello { username }` (Noise-encrypted). Server validates `1 ≤ len ≤ MAX_USERNAME_LEN`.
 6. Server replies `ServerFrame::Welcome { user_id, history }` with up to **15** prior `RoomMessage`s for the join replay.
-7. Bidirectional message flow until disconnect.
+7. Bidirectional message flow until disconnect. Broadcast uses `try_send` + evict on `Full`/`Closed` so a slow peer cannot head-of-line block delivery.
 8. Idle sessions evicted after **3600 s** of inactivity; sweeper runs every **300 s**.
 9. On disconnect: drop sender, zeroize session keys, evict from `ConnectionManager`.
+10. **Graceful shutdown:** server's accept loop, sweeper, and per-connection `pump` all share a `tokio_util::sync::CancellationToken`. SIGINT cancels the token; the `JoinSet` drains in-flight tasks; once empty, `Arc<ServerState>` refcount hits zero and the cached `psk` zeroizes. Client catches ctrl-c as a key event in raw mode (the TUI swallows the SIGINT) and returns from its event loop, dropping `room_key`.
 
-Argon2 cost is paid once per connect on both sides (~100–500 ms on commodity hardware). This is the deliberate trade-off behind the rate-limiter in §Security invariants.
+## Client TUI
+
+The client uses an alt-screen TUI built on `crossterm` 0.29 + `ratatui` 0.30 (`crossterm_0_29` feature pin so there's exactly one crossterm in the tree).
+
+### Layout
+
+```
+Secure Terminal Chat                           ← centered bold-magenta header
+ alice · 127.0.0.1:3000  —  enter · /clear …   ← cyan status bar
+┌ room ─────────────────────────────────────┐
+│ [12:34:56] alice: hello                   │
+│ [12:34:58] bob: hi                        │  ← scrolling pane, per-username color
+│ ...                                       │
+├ message ──────────────────────────────────┤
+│ ▌                                         │  ← single-line input box w/ cursor
+└───────────────────────────────────────────┘
+```
+
+When scrolled back, the room title shows `room (↑ scrolled N — End to return)` so the engaged state is obvious.
+
+### Keys
+
+| Key | Action |
+|-----|--------|
+| Enter | Send message (or `/clear` command) |
+| Backspace | Delete previous char in input |
+| Char | Append to input |
+| ↑ / ↓ | Scroll back / forward 1 message |
+| PgUp / PgDn | Scroll back / forward nearly a full pane |
+| Home / End | Oldest visible / back to live |
+| Ctrl-C | Quit cleanly (terminal restored via RAII) |
+
+### State
+
+- `messages: VecDeque<DisplayMsg>` capped at **500** entries (oldest evicted; `scroll` position adjusts).
+- Per-username color via a small palette + 31-mul hash; system lines (decryption failures, `/clear` notice) styled italic-yellow.
+- Auto-scrolls to latest while pinned (`scroll == 0`); when scrolled back, new messages bump `scroll` so the historical view stays anchored.
+- `/clear` wipes `state.messages` locally (not just on the server) and resets scroll, so every client sees a fresh empty room with only the cleared-by notice.
+- `TerminalGuard` (RAII) enters alt-screen + raw mode on construction and restores on `Drop` — even on panic the terminal is never left scrambled.
 
 ## Module layout
 
-Single binary, idiomatic split:
-
 ```
 src/
-  main.rs               // entrypoint: clap parse → cli::run
+  main.rs               // entrypoint: clap parse → cli::run + tracing init
   lib.rs                // re-exports for integration tests
-  cli.rs                // clap derive + dispatch
+  cli.rs                // clap derive + dispatch + read_password
+  proto.rs              // postcard frame enums; PROTOCOL_VERSION; MAX_FRAME_LEN; MAX_USERNAME_LEN; HISTORY_LEN
+  wire.rs               // LengthDelimitedCodec + send_postcard / recv_postcard helpers
+  error.rs              // thiserror Error + ErrorKind
   crypto/
     mod.rs
-    password.rs         // Argon2id master + HKDF split
-    room.rs             // XChaCha20-Poly1305 wrappers
-    noise.rs            // snow handshake helpers
-  proto.rs              // postcard frame enums + length-delimited codec
+    password.rs         // Argon2id master + keyed BLAKE2s split into psk + room_key
+    room.rs             // XChaCha20-Poly1305 wrappers (seal/open)
+    noise.rs            // snow Noise NNpsk0 handshake + transport helpers
   server/
-    mod.rs              // listener + per-connection task
-    stores.rs           // MessageStore, UserSessionStore
-    managers.rs         // ConnectionManager (mpsc::Sender map)
+    mod.rs              // listener, handle_connection, pump, broadcast, sweeper, shutdown
+    stores.rs           // MessageStore (ring buffer), UserSessionStore (idle eviction)
+    managers.rs         // ConnectionManager (mpsc::Sender map per session)
   client/
-    mod.rs              // connect, auth, send/receive loops
-    tui.rs              // crossterm + ratatui
-  error.rs              // thiserror types incl. ErrorKind
+    mod.rs              // connect, handshake, event_loop orchestration
+    ui.rs               // ratatui TUI: UiState, render, handle_key, TerminalGuard
+tests/
+  end_to_end.rs         // 7 integration tests (handshake, history, /clear, oversized, …)
 ```
 
-## Dependencies (target)
+## Dependencies
 
-```toml
-[dependencies]
-tokio        = { version = "1", features = ["full"] }
-tokio-util   = { version = "0.7", features = ["codec"] }
-clap         = { version = "4", features = ["derive"] }
-serde        = { version = "1", features = ["derive"] }
-postcard     = { version = "1", features = ["use-std"] }
-snow         = "0.10"
-argon2       = "0.5"
-chacha20poly1305 = "0.10"
-hkdf         = "0.12"
-sha2         = "0.10"
-zeroize      = { version = "1", features = ["derive"] }
-thiserror    = "2"
-uuid         = { version = "1", features = ["v4", "serde"] }
-crossterm    = "0.28"
-ratatui      = "0.29"
+See `Cargo.toml` for the canonical list; each direct dep has a one-line purpose comment. Summary:
 
-[dev-dependencies]
-proptest     = "1"
+```
+Async/transport:   tokio (trimmed features), tokio-util (codec + sync),
+                   futures-util (sink+std)
+CLI / I/O:         clap (derive), rpassword
+Wire / serde:      serde (derive), postcard (use-std, default-features=false)
+Crypto:            snow, argon2, chacha20poly1305, blake2, zeroize, getrandom
+Errors:            thiserror
+Identifiers:       uuid (v4 + serde)
+Logging:           tracing, tracing-subscriber (env-filter + fmt + ansi)
+TUI:               crossterm (event-stream), ratatui (default-features=false,
+                   crossterm_0_29 + layout-cache + underline-color)
+Dev:               none
 ```
 
-Removed compared to the previous draft: `srp`, `fernet`, `serde_json`, `subtle` (transitive only), `anyhow` (errors are typed end-to-end).
+Removed compared to the original draft: `srp`, `fernet`, `serde_json`, `subtle` (transitive only), `anyhow`, `hkdf`, `sha2`, `bytes` (re-exported by `tokio_util`), `proptest`, `rand`.
 
-Possible further trim: swap HKDF-SHA256 → BLAKE2s for the `master → {psk, room_key}` split. `snow` already pulls in `blake2`, so we'd drop `hkdf` + `sha2` (two crates) at the cost of a less-conventional KDF. Defer to Phase 2.
+Supply-chain hygiene: `deny.toml` runs `cargo deny check` over licenses, advisories, bans (wildcards forbidden, multi-versions warn), and sources (only crates.io trusted).
 
 ## Security invariants
 
 The Python references skip these; chat-rs enforces them:
 
-- **Zeroize on drop** for `password`, `master`, `psk`, `room_key`, transport keys held by `snow`. Wrap in `zeroize::Zeroizing` or derive `ZeroizeOnDrop`.
+- **Zeroize on drop** for `password`, `master`, `psk`, `room_key`, transport keys held by `snow`. All key types are `Zeroizing<T>` or derive `ZeroizeOnDrop`.
 - **Bounded reads** via `LengthDelimitedCodec` with `max_frame_length(64 * 1024)`. No unbounded `read_to_end` paths.
-- **Constant-time** comparisons handled inside `chacha20poly1305` and `argon2`; no direct `==` on tags or proofs in our code.
-- **No `unwrap` / `expect`** on any path reachable from network input. Malformed frames → typed error → connection drop.
-- **Logger scrub:** logging config rejects fields named `password`, `master`, `psk`, `room_key`, `auth_tag`. Tracing structured fields make this enforceable.
-- **Argon2 cost is non-negotiable** — minimum m=64 MiB, t=3 even on connect path. Rate-limit failed handshakes per source IP to avoid CPU exhaustion.
+- **Constant-time** comparisons handled inside `chacha20poly1305`, `blake2`, and `argon2`; no direct `==` on tags or proofs in our code.
+- **No `unwrap` / `expect`** on any path reachable from network input. The single `expect` in non-test code is `crypto/noise.rs::params()` parsing the static Noise pattern string — to be folded into a `LazyLock` (see TODO Phase 4).
+- **Logger scrub** is *discipline-only* today: module-level doc comments in `server/mod.rs` and `client/mod.rs` list forbidden field names (`password`, `psk`, `room_key`, AEAD nonces/tags). A structured-logger filter would make this enforceable.
+- **Argon2 cost on the server is paid once at startup**, not per connect — `ServerState` caches the derived `psk` and drops the password before listening. Closes the otherwise-trivial 64 MiB-per-connect DoS.
+- **Per-message AEAD AAD** binds `(from, timestamp_ms)` so a malicious server can't relabel sender or rewind timestamps. The server additionally rejects `ClientFrame::Message` with `ad.from != session user_id` to fail loud rather than make peers' decrypts silently fail.
 
 ## Testing
 
-- Unit: `crypto/password.rs`, `crypto/room.rs`, `proto.rs` round-trip, store/manager invariants.
-- Integration: spin up a server on a random port, connect two in-process clients, exchange a message, snapshot the bytes the server observes — assert no plaintext appears.
-- Negative: wrong-password handshake fails fast and cleanly; oversized frame rejected without OOM; replayed ciphertext rejected (post-MVP — requires a per-room counter or skip-list).
-- Property tests: `proto` enums round-trip through `postcard` for arbitrary inputs (`proptest`).
+- Unit (in-tree): `crypto/password.rs` (4), `crypto/room.rs` (4), `crypto/noise.rs` (2), `server/stores.rs` (1) — round-trip seal/open, wrong-password rejects, AD tampering rejects, truncated ciphertext rejects, wrong-PSK handshake fails, history ring-buffer cap.
+- Integration (`tests/end_to_end.rs`): two-client message exchange (asserts plaintext does not appear in broadcast bytes), wrong-password failure, history replay for late joiner, history cap over wire, `/clear` propagation, oversized-frame rejection without OOM, unique `user_id` per connection.
+- Pre-commit gate: `build.sh` runs `cargo fmt → cargo clippy --all-targets -- -D warnings → cargo test`.
+- Supply chain: `cargo deny check` (licenses + advisories + bans + sources).
+
+Outstanding test gaps tracked in TODO Phase 4: sweeper-driven idle eviction, slow-peer broadcast (HOL), `ad.from` rejection, over-cap username rejection, duplicate `Hello` rejection.
 
 ## Open questions
 
-- **Password on the CLI.** `--password <pw>` exposes the password via `ps` / `/proc/<pid>/cmdline`. Inherited from the Python references but at odds with the rest of this design. Options: read from stdin if not provided, accept `CHAT_RS_PASSWORD` env, or interactive prompt. Pick before Phase 1.
-- **Replay protection inside the room.** Currently the AEAD `ad` binds sender + timestamp, but a malicious server can re-broadcast an old ciphertext. Mitigation options: per-sender monotonic counter in `ad`, or a sliding-window cache on each client. Decide before Phase 4.
-- **Username spoofing.** `username` is in `Welcome` and `ServerFrame::Message` but not sealed under the room key. A malicious server can swap usernames. Fix by including `username` in `MessageAd`.
-- **Forward secrecy on the room key.** Currently `room_key` is static for the password. To get forward secrecy we'd need a ratchet (Double Ratchet–lite) — not free; defer unless threat model demands it.
-- **Protocol-version negotiation.** Server advertises `server_version`; client doesn't. Fine for v0 (clients just refuse incompatible versions), but consider a `ClientFrame::Hello` field if we ever need server-side gating.
-- **KDF swap.** Replace HKDF-SHA256 with BLAKE2s in `crypto::password` to drop `hkdf` + `sha2`. Decide in Phase 2.
+Tracked in detail in [`01-TODO.md`](01-TODO.md) Phase 5. Headlines:
+
+- **Replay protection inside the room** — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client.
+- **Bind `username` into `MessageAd`** — close the relabeling gap (`from` Uuid is bound; display name is not).
+- **Include `username` in `ServerFrame::Cleared`** — UX nicety; render `cleared by alice` not `cleared by 6e3b…`.
+- **Forward secrecy on the room key** — currently fixed for the room's lifetime. Tentative direction: server-driven salt rotation (Phase 5 has the full options table and reasoning).
+- **Protocol-version negotiation** — server advertises; client doesn't. Add a `ClientFrame::Hello` field if server-side gating ever matters.
+- **Rate-limit failed Noise handshakes** — per source IP. Defense-in-depth now that the per-connect Argon2 cost is gone.

@@ -94,6 +94,8 @@ where
         guard
             .term()
             .draw(|f: &mut Frame| ui::render(f, state))
+            // ^ render now takes &mut state to stash last_inner_h for paging
+            //   keys; the closure captures the outer &mut UiState.
             .map_err(Error::Io)?;
 
         tokio::select! {
@@ -139,6 +141,10 @@ fn handle_server_frame(
             None
         }
         ServerFrame::Cleared { by } => {
+            // Wipe local display too, so /clear actually empties the room
+            // for every client (sender included). The notice survives so
+            // the user sees feedback that the clear happened.
+            state.clear_messages();
             state.push_system(format!("cleared by {by}"));
             None
         }

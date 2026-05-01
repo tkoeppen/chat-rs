@@ -30,7 +30,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Crypto deps: `snow`, `argon2`, `chacha20poly1305`, `blake2`, `zeroize`
 - [x] Password input: `rpassword` (interactive prompt) + `CHAT_RS_PASSWORD` env
 - [x] Logging: `tracing` + `tracing-subscriber`
-- [x] TUI deps: `crossterm` (event-stream feature) + `ratatui` 0.30 (`crossterm_0_29` feature pin so there's exactly one crossterm in the tree). Client uses an alt-screen TUI: status bar, scrolling room pane, input box; per-username color via a small palette; RAII terminal guard restores even on panic; ctrl-c is captured as a key event in raw mode
+- [x] TUI deps: `crossterm` (event-stream feature) + `ratatui` 0.30 (`crossterm_0_29` feature pin so there's exactly one crossterm in the tree). Client uses an alt-screen TUI: centered bold-magenta `Secure Terminal Chat` header, cyan status bar, scrolling room pane (PgUp/PgDn/↑/↓/Home/End — title shows `(↑ scrolled N — End to return)` while engaged), single-line input box; per-username color via a small palette; system lines (decryption fail, `/clear` notice) styled italic-yellow; `/clear` wipes local `state.messages` so every client sees a fresh empty room; RAII `TerminalGuard` restores raw mode + alt-screen even on panic; ctrl-c is captured as a key event in raw mode
 - [x] Dev deps: none (`proptest` was added then removed; never imported)
 - [x] `cargo fmt` + `cargo clippy -- -D warnings` clean baseline
 
@@ -88,6 +88,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Password input source (stdin / env / interactive prompt) — `CHAT_RS_PASSWORD` env, falling back to interactive `rpassword` prompt; no `--password` flag
 - [ ] Replay protection inside the room — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client
 - [ ] Bind `username` into `MessageAd` so a malicious server can't relabel messages
+- [ ] Include `username` in `ServerFrame::Cleared` (currently only `by: Uuid`) so the client can render `cleared by alice` instead of `cleared by 6e3b…`. Small wire-protocol additive change; one extra field
 - [ ] Decide whether room-key forward secrecy (ratchet) is in scope for 1.0 or deferred
   - **Current gap.** The Noise transport already has forward secrecy (per-connection X25519 ephemerals). The room layer does not: `room_key = BLAKE2s(Argon2id(password, room_salt), "chat-rs/v1/room")` is fixed for the life of the room. Anyone who later learns the password decrypts every recorded ciphertext.
   - **Options (cheap → strong):**
