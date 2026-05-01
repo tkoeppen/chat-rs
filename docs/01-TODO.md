@@ -64,7 +64,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 ## Phase 4 — Polish & safety
 
 - [x] Stale-session cleanup task (3600 s timeout, 300 s sweep interval)
-- [ ] Graceful shutdown (Ctrl-C drains, zeroizes keys, closes sockets) — currently the process exits abruptly; Tokio drops are clean but no explicit drain
+- [x] Graceful shutdown (Ctrl-C drains, zeroizes keys, closes sockets). Server uses `tokio_util::sync::CancellationToken` + `JoinSet`: ctrl-c cancels the token, the accept loop and per-connection `pump` arms exit, and the listener drops while the JoinSet drains all in-flight tasks. `Arc<ServerState>` refcount then hits zero and the cached `psk` zeroizes via `Zeroizing`. Client selects on `tokio::signal::ctrl_c()` in its main loop and returns; the room key wipes on drop.
 - [x] `tracing` + `tracing-subscriber` with `RUST_LOG`/`EnvFilter` (default `chat_rs=info,warn`); discipline-only field scrub via module-level doc comments listing forbidden field names — no structured logger filter yet
 - [x] Cache Noise psk in `ServerState::new` and drop the password before listening — closes the per-connect 64 MiB Argon2 DoS
 - [x] Reject `ClientFrame::Message` with `ad.from != session user_id` — prevents AAD-mismatch DoS where peers' decrypts silently fail

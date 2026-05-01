@@ -73,6 +73,10 @@ pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>
     loop {
         tokio::select! {
             biased;
+            _ = tokio::signal::ctrl_c() => {
+                debug!("ctrl-c received; disconnecting");
+                return Ok(());
+            }
             outgoing = out_rx.recv() => {
                 match outgoing {
                     Some(frame_out) => send_encrypted(&mut framed, &mut transport, &frame_out).await?,

@@ -15,6 +15,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -65,27 +67,52 @@ pub async fn run(addr: SocketAddr, password: Zeroizing<Vec<u8>>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "listening");
 
-    {
-        let state = state.clone();
-        tokio::spawn(sweeper(state));
-    }
+    let shutdown = CancellationToken::new();
+    let mut tasks = JoinSet::new();
+
+    tasks.spawn(sweeper(state.clone(), shutdown.clone()));
 
     loop {
-        let (sock, peer) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(state, sock, peer).await {
-                warn!(%peer, error = %e, "connection error");
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = tokio::signal::ctrl_c() => {
+                info!("ctrl-c received; shutting down");
+                shutdown.cancel();
+                break;
             }
-        });
+            res = listener.accept() => {
+                match res {
+                    Ok((sock, peer)) => {
+                        let state = state.clone();
+                        let shutdown = shutdown.clone();
+                        tasks.spawn(async move {
+                            if let Err(e) = handle_connection(state, sock, peer, shutdown).await {
+                                warn!(%peer, error = %e, "connection error");
+                            }
+                        });
+                    }
+                    Err(e) => warn!(error = %e, "accept failed"),
+                }
+            }
+        }
     }
+
+    drop(listener);
+    info!(active = tasks.len(), "draining tasks");
+    while tasks.join_next().await.is_some() {}
+    info!("shutdown complete");
+    Ok(())
 }
 
-async fn sweeper(state: Arc<ServerState>) {
+async fn sweeper(state: Arc<ServerState>, shutdown: CancellationToken) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.tick().await; // skip immediate fire
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
         let stale = {
             let s = state.sessions.lock().await;
             s.stale()
@@ -108,6 +135,7 @@ async fn handle_connection(
     state: Arc<ServerState>,
     sock: TcpStream,
     peer: SocketAddr,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
     let mut framed = frame(sock);
@@ -190,6 +218,7 @@ async fn handle_connection(
         &mut framed,
         &mut transport,
         &mut rx,
+        &shutdown,
     )
     .await;
 
@@ -210,6 +239,7 @@ async fn pump<S>(
     framed: &mut FramedStream<S>,
     transport: &mut snow::TransportState,
     rx: &mut mpsc::Receiver<ServerFrame>,
+    shutdown: &CancellationToken,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -217,6 +247,7 @@ where
     loop {
         tokio::select! {
             biased;
+            _ = shutdown.cancelled() => return Ok(()),
             outgoing = rx.recv() => {
                 match outgoing {
                     Some(frame_out) => send_encrypted(framed, transport, &frame_out).await?,

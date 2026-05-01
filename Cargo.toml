@@ -24,6 +24,7 @@ tokio = { version = "1", features = [
   "time",
   "io-util",
   "io-std",
+  "signal",
 ] }
 # `LengthDelimitedCodec` for 4-byte length-prefixed framing (64 KiB cap).
 tokio-util = { version = "0.7", features = ["codec"] }
