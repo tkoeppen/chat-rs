@@ -1,17 +1,17 @@
 use argon2::{Algorithm, Argon2, Params, Version};
-use hkdf::Hkdf;
-use sha2::Sha256;
+use blake2::Blake2sMac256;
+use blake2::digest::Mac;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub const KEY_LEN: usize = 32;
 const ARGON2_M_KIB: u32 = 64 * 1024;
 const ARGON2_T: u32 = 3;
 const ARGON2_P: u32 = 1;
 
-const PSK_INFO: &[u8] = b"chat-rs/v1/psk";
-const ROOM_INFO: &[u8] = b"chat-rs/v1/room";
+const PSK_LABEL: &[u8] = b"chat-rs/v1/psk";
+const ROOM_LABEL: &[u8] = b"chat-rs/v1/room";
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct DerivedKeys {
@@ -26,13 +26,22 @@ pub fn derive_keys(password: &[u8], room_salt: &[u8; 32]) -> Result<DerivedKeys>
     let mut master = Zeroizing::new([0u8; KEY_LEN]);
     argon.hash_password_into(password, room_salt, master.as_mut())?;
 
-    let hk = Hkdf::<Sha256>::new(None, master.as_ref());
-    let mut psk = [0u8; KEY_LEN];
-    let mut room_key = [0u8; KEY_LEN];
-    hk.expand(PSK_INFO, &mut psk)?;
-    hk.expand(ROOM_INFO, &mut room_key)?;
+    Ok(DerivedKeys {
+        psk: blake2s_kdf(master.as_ref(), PSK_LABEL)?,
+        room_key: blake2s_kdf(master.as_ref(), ROOM_LABEL)?,
+    })
+}
 
-    Ok(DerivedKeys { psk, room_key })
+/// Keyed BLAKE2s-256: distinct labels yield independent 32-byte keys from the
+/// same Argon2 master. Same role HKDF-Expand played before, with one less
+/// crate in the tree (BLAKE2s is already pulled in by argon2 + snow).
+fn blake2s_kdf(master: &[u8], label: &[u8]) -> Result<[u8; KEY_LEN]> {
+    let mut mac = <Blake2sMac256 as Mac>::new_from_slice(master).map_err(|_| Error::Kdf)?;
+    mac.update(label);
+    let out = mac.finalize().into_bytes();
+    let mut k = [0u8; KEY_LEN];
+    k.copy_from_slice(&out);
+    Ok(k)
 }
 
 #[cfg(test)]

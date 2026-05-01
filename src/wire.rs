@@ -1,7 +1,7 @@
-use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::bytes::Bytes;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::error::{Error, Result};

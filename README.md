@@ -10,7 +10,7 @@ Early development. The wire protocol is not yet stable.
 
 ## Design
 
-- **Password stretching:** Argon2id (m=64 MiB, t=3, p=1) over `(password, room_salt)`, split via HKDF-SHA256 into a Noise PSK and a room AEAD key.
+- **Password stretching:** Argon2id (m=64 MiB, t=3, p=1) over `(password, room_salt)`, split via keyed BLAKE2s into a Noise PSK and a room AEAD key.
 - **Authenticated key exchange:** Noise NNpsk0 (X25519 + ChaCha20-Poly1305 + BLAKE2s) using the derived PSK — gives mutual auth and forward secrecy from a small, well-audited pattern.
 - **Transport:** raw TCP with `LengthDelimitedCodec` framing (64 KiB cap), `postcard` for binary serde.
 - **Message encryption:** XChaCha20-Poly1305 with a fresh 24-byte random nonce per message; `MessageAd { from, timestamp_ms }` is bound in as AAD.
@@ -33,6 +33,33 @@ chat-rs connect SERVER_IP 3000 username
 ```
 
 Inside the client REPL, `/clear` wipes the room history for everyone.
+
+## Try it locally
+
+One server + two clients, each in its own terminal, talking on `127.0.0.1`. The `CHAT_RS_PASSWORD` export is used here to skip three interactive prompts; for real use, just run the commands without it and type the password when asked.
+
+**Terminal 1 — server:**
+
+```sh
+export CHAT_RS_PASSWORD=hunter2
+cargo run --release -- serve 127.0.0.1 3000
+```
+
+**Terminal 2 — alice:**
+
+```sh
+export CHAT_RS_PASSWORD=hunter2
+cargo run --release -- connect 127.0.0.1 3000 alice
+```
+
+**Terminal 3 — bob:**
+
+```sh
+export CHAT_RS_PASSWORD=hunter2
+cargo run --release -- connect 127.0.0.1 3000 bob
+```
+
+Type a line in alice's window — bob sees it as `[hh:mm:ss] alice: <message>` and vice-versa. The last 15 messages are replayed to anyone who joins later. Send `/clear` from either client to wipe the room history for everyone. Ctrl-D (EOF) on a client disconnects it cleanly.
 
 ## Build
 

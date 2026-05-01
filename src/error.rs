@@ -24,8 +24,8 @@ pub enum Error {
     #[error("argon2: {0}")]
     Argon2(argon2::Error),
 
-    #[error("hkdf invalid length")]
-    HkdfLen,
+    #[error("kdf failure")]
+    Kdf,
 
     #[error("aead failure")]
     Aead,
@@ -49,12 +49,6 @@ pub enum Error {
 impl From<argon2::Error> for Error {
     fn from(e: argon2::Error) -> Self {
         Error::Argon2(e)
-    }
-}
-
-impl From<hkdf::InvalidLength> for Error {
-    fn from(_: hkdf::InvalidLength) -> Self {
-        Error::HkdfLen
     }
 }
 

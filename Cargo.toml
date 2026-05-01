@@ -32,8 +32,6 @@ futures-util = { version = "0.3", default-features = false, features = [
   "std",
   "sink",
 ] }
-# `Bytes` payloads for the codec's `Encoder<Bytes>` impl.
-bytes = "1"
 # CLI parser (subcommands + positional args via `#[derive(Parser)]`).
 clap = { version = "4", features = ["derive"] }
 # `#[derive(Serialize, Deserialize)]` on wire frames.
@@ -48,10 +46,10 @@ snow = "0.10"
 argon2 = "0.5"
 # XChaCha20-Poly1305 AEAD for room messages (24-byte random nonce).
 chacha20poly1305 = "0.10"
-# HKDF expand of the Argon2 master into separate `psk` and `room_key` labels.
-hkdf = "0.13"
-# SHA-256 backing for HKDF.
-sha2 = "0.11"
+# Keyed BLAKE2s-256 used as a one-shot KDF: splits the Argon2 master into
+# `psk` and `room_key` by labelling. Already in the tree via argon2 + snow,
+# so this costs no new build-time dep.
+blake2 = "0.10"
 # Wipes password material, derived keys, and session keys on drop.
 zeroize = { version = "1", features = ["zeroize_derive"] }
 # Typed error enum for the library boundary (no `anyhow`).

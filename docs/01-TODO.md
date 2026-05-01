@@ -26,11 +26,12 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 ## Phase 0 — Bootstrap
 
 - [x] `cargo init` with edition 2024 (uses `src/main.rs` + `src/lib.rs`, *not* `src/bin/`)
-- [x] Core deps: `tokio`, `tokio-util`, `futures-util`, `bytes`, `clap`, `serde`, `postcard`, `thiserror`, `uuid`
-- [x] Crypto deps: `snow`, `argon2`, `chacha20poly1305`, `hkdf`, `sha2`, `zeroize`, `rand`
+- [x] Core deps: `tokio`, `tokio-util`, `futures-util`, `clap`, `serde`, `postcard`, `thiserror`, `uuid`, `getrandom` (`bytes` re-exported via `tokio_util::bytes`)
+- [x] Crypto deps: `snow`, `argon2`, `chacha20poly1305`, `blake2`, `zeroize`
 - [x] Password input: `rpassword` (interactive prompt) + `CHAT_RS_PASSWORD` env
+- [x] Logging: `tracing` + `tracing-subscriber`
 - [ ] TUI deps: `crossterm`, `ratatui` *(deferred — v0 uses plain stdin/stdout)*
-- [x] Dev deps: `proptest`
+- [x] Dev deps: none (`proptest` was added then removed; never imported)
 - [x] `cargo fmt` + `cargo clippy -- -D warnings` clean baseline
 
 ## Phase 1 — CLI + transport skeleton
@@ -43,13 +44,13 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 
 ## Phase 2 — Crypto core
 
-- [x] `crypto::password` — Argon2id over `(password, room_salt)` → `master`; HKDF split into `psk` + `room_key`
+- [x] `crypto::password` — Argon2id over `(password, room_salt)` → `master`; keyed BLAKE2s splits master into `psk` + `room_key`
 - [x] `crypto::noise` — Noise NNpsk0 handshake helpers (`snow` initiator + responder; both call `Builder::psk(0, &psk)` before starting)
 - [x] `crypto::room` — XChaCha20-Poly1305 seal/open helpers; AD = postcard(`MessageAd`)
 - [x] `Zeroizing` wrappers / `ZeroizeOnDrop` derives on `master`, `psk`, `room_key`
 - [x] `error::ErrorKind` enum (`AuthFailed`, `BadFrame`, `RateLimited`, `UnsupportedVersion`, `Internal`)
 - [x] Unit tests: round-trip seal/open, wrong-password rejects, AD tampering rejects (4 room + 4 password + 2 noise tests)
-- [ ] Decide: keep `hkdf` + `sha2`, or swap KDF to BLAKE2s (already pulled in by `snow`) and drop both crates
+- [x] Swap KDF to keyed BLAKE2s (already in the tree via argon2 + snow); dropped `hkdf` and `sha2` direct deps and the duplicate `sha2 0.11` in the lock
 
 ## Phase 3 — Protocol + chat
 
@@ -76,6 +77,11 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Integration test: `/clear` propagates to all clients
 - [x] Integration test: oversized frame rejected without OOM
 - [x] Integration test: unique `user_id` per connection
+- [x] Dependency audit: per-dep purpose comment in `Cargo.toml`; trim `tokio` features from `"full"` to the actual subset used; drop unused `bytes` direct dep (`tokio_util::bytes::Bytes` works); drop unused `proptest` dev-dep
+- [x] Add `deny.toml` (cargo-deny: licenses, advisories, bans, sources — all four checks pass)
+- [x] Set `postcard = { default-features = false, features = ["use-std"] }` to drop the `heapless-cas` default → drops the unmaintained `atomic-polyfill` (RUSTSEC-2023-0089)
+- [ ] Test gaps to fill: (a) sweeper-driven idle eviction — would need an injectable timeout; (b) slow-peer broadcast — full-mpsc peer doesn't stall delivery to others; (c) `ad.from != user_id` is rejected with `Protocol`; (d) over-cap username is rejected; (e) duplicate `Hello` after auth is rejected
+- [ ] Memoize the Noise pattern parse — currently `crypto/noise.rs::params()` re-parses `"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"` on every handshake and uses `.expect()` (the only `expect` in non-test code; infallible, but a `LazyLock<NoiseParams>` removes both the per-handshake work and the lone exception to the no-`expect` rule)
 
 ## Phase 5 — Open questions to resolve before 1.0
 
@@ -83,7 +89,14 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [ ] Replay protection inside the room — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client
 - [ ] Bind `username` into `MessageAd` so a malicious server can't relabel messages
 - [ ] Decide whether room-key forward secrecy (ratchet) is in scope for 1.0 or deferred
-- [ ] KDF swap (HKDF-SHA256 → BLAKE2s) to drop `hkdf` + `sha2`
+  - **Current gap.** The Noise transport already has forward secrecy (per-connection X25519 ephemerals). The room layer does not: `room_key = BLAKE2s(Argon2id(password, room_salt), "chat-rs/v1/room")` is fixed for the life of the room. Anyone who later learns the password decrypts every recorded ciphertext.
+  - **Options (cheap → strong):**
+    1. **Status quo.** Document the gap. Acceptable for casual use, not for sensitive use.
+    2. **Per-sender hash ratchet.** Each client steps `K_{n+1} = BLAKE2s(K_n, "ratchet")` per send and includes `n` in `MessageAd`. Forward-secret against a stolen current key, but not against password recovery (attacker re-derives `K_0` and walks forward). Adds per-sender state + ordering machinery.
+    3. **Server-driven salt rotation.** Server emits a fresh `room_salt` every N minutes; clients re-derive `room_key` and wipe the previous one. Delivers forward secrecy *against password compromise* — the actual realistic attack — without per-sender state. Late joiners only see traffic from the current epoch (history replay would either skip or break, decide separately).
+    4. **Sender-keys + DH ratchet.** MLS / Signal-style. Adds post-compromise security too. Heavy machinery for the "shared password, ephemeral room" model; almost certainly overkill for 1.0.
+  - **Tentative recommendation: defer full ratchet, ship Option 3 (salt rotation) as the 1.0 forward-secrecy story.** Best value-per-line; fits the existing server-mints-salt design; avoids per-sender state machines. Open sub-decisions if Option 3 lands: rotation interval, behavior on rotation mid-message, history-replay semantics across an epoch boundary.
+- [x] KDF swap (HKDF-SHA256 → keyed BLAKE2s); `hkdf` + `sha2` direct deps dropped
 - [ ] Protocol-version negotiation — add a client version field if server-side gating ever matters
 
 ## Improvements applied vs initial draft (rationale)
