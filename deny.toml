@@ -1,0 +1,59 @@
+# cargo-deny configuration for chat-rs.
+# Run with: cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Licenses — allow only well-understood permissive licenses. Anything outside
+# this list (especially copyleft) requires a deliberate decision.
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec database. Yanked crates and unmaintained dependencies
+# warn but don't block; known vulnerabilities are an error by default.
+# ---------------------------------------------------------------------------
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+ignore = []
+
+# ---------------------------------------------------------------------------
+# Bans — block wildcards and surface duplicate versions. Crypto trees often
+# end up with multiple copies of small crates (digest, generic-array, etc.),
+# so duplicates warn rather than fail.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# Sources — only crates.io is trusted. Any git or alt-registry dependency
+# requires an explicit allow entry below.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

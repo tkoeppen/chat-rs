@@ -1,0 +1,305 @@
+//! Server module.
+//!
+//! NEVER log fields named `password`, `psk`, `room_key`, or any AEAD nonce/tag.
+//! Plaintext message bodies are also forbidden in logs.
+
+pub mod managers;
+pub mod stores;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use crate::crypto::noise::{handshake_responder, recv_encrypted, send_encrypted};
+use crate::crypto::password::derive_keys;
+use crate::error::{Error, ErrorKind, Result};
+use crate::proto::{ClientFrame, MAX_USERNAME_LEN, PROTOCOL_VERSION, RoomMessage, ServerFrame};
+use crate::wire::{FramedStream, frame, send_postcard};
+
+use managers::ConnectionManager;
+use stores::{MessageStore, UserSessionStore};
+
+const SESSION_TIMEOUT: Duration = Duration::from_secs(3600);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+const OUTBOX_DEPTH: usize = 64;
+
+pub struct ServerState {
+    pub room_salt: [u8; 32],
+    /// Cached at startup. The password is derived once and then dropped, so an
+    /// unauthenticated TCP connect cannot trigger Argon2 work.
+    pub psk: Zeroizing<[u8; 32]>,
+    pub messages: Mutex<MessageStore>,
+    pub sessions: Mutex<UserSessionStore>,
+    pub connections: Mutex<ConnectionManager>,
+}
+
+impl ServerState {
+    pub fn new(password: &Zeroizing<Vec<u8>>) -> Result<Arc<Self>> {
+        let mut salt = [0u8; 32];
+        getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
+        let keys = derive_keys(password, &salt)?;
+        let psk = Zeroizing::new(keys.psk);
+        // `keys` (with room_key) drops here — zeroized.
+        Ok(Arc::new(Self {
+            room_salt: salt,
+            psk,
+            messages: Mutex::new(MessageStore::new()),
+            sessions: Mutex::new(UserSessionStore::new(SESSION_TIMEOUT)),
+            connections: Mutex::new(ConnectionManager::new()),
+        }))
+    }
+}
+
+pub async fn run(addr: SocketAddr, password: Zeroizing<Vec<u8>>) -> Result<()> {
+    let state = ServerState::new(&password)?;
+    drop(password);
+    let listener = TcpListener::bind(addr).await?;
+    info!(%addr, "listening");
+
+    {
+        let state = state.clone();
+        tokio::spawn(sweeper(state));
+    }
+
+    loop {
+        let (sock, peer) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(state, sock, peer).await {
+                warn!(%peer, error = %e, "connection error");
+            }
+        });
+    }
+}
+
+async fn sweeper(state: Arc<ServerState>) {
+    let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+    ticker.tick().await; // skip immediate fire
+    loop {
+        ticker.tick().await;
+        let stale = {
+            let s = state.sessions.lock().await;
+            s.stale()
+        };
+        if stale.is_empty() {
+            continue;
+        }
+        let count = stale.len();
+        let mut sessions = state.sessions.lock().await;
+        let mut conns = state.connections.lock().await;
+        for id in stale {
+            sessions.remove(&id);
+            conns.remove(&id);
+        }
+        info!(evicted = count, "sweeper evicted stale sessions");
+    }
+}
+
+async fn handle_connection(
+    state: Arc<ServerState>,
+    sock: TcpStream,
+    peer: SocketAddr,
+) -> Result<()> {
+    sock.set_nodelay(true).ok();
+    let mut framed = frame(sock);
+
+    // Phase 0: plaintext server hello.
+    send_postcard(
+        &mut framed,
+        &ServerFrame::Hello {
+            room_salt: state.room_salt,
+            server_version: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+
+    // Phase 1: Noise NNpsk0 handshake using the pre-derived psk.
+    let mut transport = match handshake_responder(&state.psk, &mut framed).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(%peer, error = %e, "handshake failed");
+            return Err(e);
+        }
+    };
+
+    // First Noise-encrypted frame from client must be ClientFrame::Hello.
+    let first: ClientFrame = recv_encrypted(&mut framed, &mut transport).await?;
+    let username = match first {
+        ClientFrame::Hello { username } => {
+            if username.is_empty() || username.len() > MAX_USERNAME_LEN {
+                let _ = send_encrypted(
+                    &mut framed,
+                    &mut transport,
+                    &ServerFrame::Error {
+                        reason: ErrorKind::BadFrame,
+                    },
+                )
+                .await;
+                return Err(Error::Protocol("invalid username length"));
+            }
+            username
+        }
+        _ => {
+            let _ = send_encrypted(
+                &mut framed,
+                &mut transport,
+                &ServerFrame::Error {
+                    reason: ErrorKind::BadFrame,
+                },
+            )
+            .await;
+            return Err(Error::Protocol("expected ClientFrame::Hello"));
+        }
+    };
+
+    let user_id = Uuid::new_v4();
+    let (tx, mut rx) = mpsc::channel::<ServerFrame>(OUTBOX_DEPTH);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(user_id, username.clone());
+        let mut conns = state.connections.lock().await;
+        conns.insert(user_id, tx);
+    }
+    info!(%peer, %user_id, %username, "connected");
+
+    let history = {
+        let m = state.messages.lock().await;
+        m.snapshot()
+    };
+    send_encrypted(
+        &mut framed,
+        &mut transport,
+        &ServerFrame::Welcome { user_id, history },
+    )
+    .await?;
+
+    let result = pump(
+        &state,
+        user_id,
+        &username,
+        &mut framed,
+        &mut transport,
+        &mut rx,
+    )
+    .await;
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&user_id);
+        let mut conns = state.connections.lock().await;
+        conns.remove(&user_id);
+    }
+    info!(%peer, %user_id, %username, "disconnected");
+    result
+}
+
+async fn pump<S>(
+    state: &Arc<ServerState>,
+    user_id: Uuid,
+    username: &str,
+    framed: &mut FramedStream<S>,
+    transport: &mut snow::TransportState,
+    rx: &mut mpsc::Receiver<ServerFrame>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        tokio::select! {
+            biased;
+            outgoing = rx.recv() => {
+                match outgoing {
+                    Some(frame_out) => send_encrypted(framed, transport, &frame_out).await?,
+                    None => return Ok(()),
+                }
+            }
+            incoming = framed.next() => {
+                let bytes = match incoming {
+                    Some(Ok(b)) => b,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()),
+                };
+                let pt = crate::crypto::noise::transport_open(transport, &bytes)?;
+                let msg: ClientFrame = postcard::from_bytes(&pt)?;
+                handle_client_frame(state, user_id, username, msg).await?;
+            }
+        }
+    }
+}
+
+async fn handle_client_frame(
+    state: &Arc<ServerState>,
+    user_id: Uuid,
+    username: &str,
+    msg: ClientFrame,
+) -> Result<()> {
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.touch(user_id);
+    }
+    match msg {
+        ClientFrame::Hello { .. } => Err(Error::Protocol("duplicate Hello")),
+        ClientFrame::Message { ad, ciphertext } => {
+            // Reject mismatched `ad.from` so a misbehaving client can't make
+            // peers' decrypts mysteriously fail (the AAD wouldn't match).
+            if ad.from != user_id {
+                return Err(Error::Protocol("ad.from does not match session user_id"));
+            }
+            let room_msg = RoomMessage {
+                from: user_id,
+                username: username.to_string(),
+                ad,
+                ciphertext,
+            };
+            {
+                let mut m = state.messages.lock().await;
+                m.push(room_msg.clone());
+            }
+            broadcast(state, ServerFrame::Message(room_msg)).await;
+            Ok(())
+        }
+        ClientFrame::Clear => {
+            {
+                let mut m = state.messages.lock().await;
+                m.clear();
+            }
+            broadcast(state, ServerFrame::Cleared { by: user_id }).await;
+            Ok(())
+        }
+    }
+}
+
+/// Broadcast a frame to all connected peers. Uses `try_send` so a slow or stuck
+/// peer cannot head-of-line block delivery to everyone else; full or closed
+/// outboxes are evicted.
+async fn broadcast(state: &Arc<ServerState>, frame_out: ServerFrame) {
+    let snapshot = {
+        let conns = state.connections.lock().await;
+        conns.snapshot()
+    };
+    let mut dead = Vec::new();
+    for (id, tx) in snapshot {
+        match tx.try_send(frame_out.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => dead.push(id),
+        }
+    }
+    if !dead.is_empty() {
+        let dead_count = dead.len();
+        let mut conns = state.connections.lock().await;
+        for id in dead {
+            conns.remove(&id);
+        }
+        debug!(evicted = dead_count, "broadcast evicted slow or dead peers");
+    }
+}

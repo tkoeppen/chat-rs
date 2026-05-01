@@ -1,0 +1,72 @@
+[package]
+name = "chat-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Encrypted terminal chat. No persistence, no logs."
+
+[[bin]]
+name = "chat-rs"
+path = "src/main.rs"
+
+[lib]
+name = "chat_rs"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime — multi-threaded scheduler, TCP, mpsc, time, io. Trimmed to the
+# subset actually used; "full" would also pull fs/signal/process/parking_lot.
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "net",
+  "sync",
+  "time",
+  "io-util",
+  "io-std",
+] }
+# `LengthDelimitedCodec` for 4-byte length-prefixed framing (64 KiB cap).
+tokio-util = { version = "0.7", features = ["codec"] }
+# `SinkExt` / `StreamExt` for `Framed::send().await` and `framed.next().await`.
+futures-util = { version = "0.3", default-features = false, features = [
+  "std",
+  "sink",
+] }
+# `Bytes` payloads for the codec's `Encoder<Bytes>` impl.
+bytes = "1"
+# CLI parser (subcommands + positional args via `#[derive(Parser)]`).
+clap = { version = "4", features = ["derive"] }
+# `#[derive(Serialize, Deserialize)]` on wire frames.
+serde = { version = "1", features = ["derive"] }
+# Binary serde format used on the wire and as AEAD AAD; `use-std` for `to_stdvec`.
+# `default-features = false` drops the `heapless-cas` default → drops heapless →
+# drops the unmaintained `atomic-polyfill` (RUSTSEC-2023-0089).
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+# Noise NNpsk0 handshake (X25519 + ChaCha20-Poly1305 + BLAKE2s).
+snow = "0.10"
+# Argon2id password stretching over (password, room_salt) → master.
+argon2 = "0.5"
+# XChaCha20-Poly1305 AEAD for room messages (24-byte random nonce).
+chacha20poly1305 = "0.10"
+# HKDF expand of the Argon2 master into separate `psk` and `room_key` labels.
+hkdf = "0.13"
+# SHA-256 backing for HKDF.
+sha2 = "0.11"
+# Wipes password material, derived keys, and session keys on drop.
+zeroize = { version = "1", features = ["zeroize_derive"] }
+# Typed error enum for the library boundary (no `anyhow`).
+thiserror = "2"
+# Per-connection user identifier (random v4); serialized in protocol frames.
+uuid = { version = "1", features = ["v4", "serde"] }
+# OS RNG for AEAD nonces and the server's room salt.
+getrandom = "0.4"
+# Interactive password prompt (no echo) when `CHAT_RS_PASSWORD` is unset.
+rpassword = "7"
+# Structured logging macros (`info!` / `debug!` / `warn!`) used across server and client.
+tracing = "0.1"
+# Subscriber wiring `RUST_LOG` env-filter to a stderr fmt layer with ANSI colors.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "env-filter",
+  "fmt",
+  "ansi",
+] }
