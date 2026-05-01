@@ -59,7 +59,7 @@ export CHAT_RS_PASSWORD=hunter2
 cargo run --release -- connect 127.0.0.1 3000 bob
 ```
 
-Type a line in alice's window — bob sees it as `[hh:mm:ss] alice: <message>` and vice-versa. The last 15 messages are replayed to anyone who joins later. Send `/clear` from either client to wipe the room history for everyone. Ctrl-D (EOF) on a client disconnects it cleanly.
+Each client opens a small TUI (alt-screen, raw mode): scrolling room pane on top, single-line input box at the bottom, status bar with the connect info. Type a line and hit **enter** to send — peers see it as `[hh:mm:ss] alice: <message>` with usernames colored. The last 15 messages are replayed to anyone who joins later. Send `/clear` to wipe the room history for everyone. **Ctrl-C** quits the client cleanly (the terminal is restored even on panic via an RAII guard).
 
 ## Build
 

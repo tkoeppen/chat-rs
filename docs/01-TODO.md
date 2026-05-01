@@ -30,7 +30,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Crypto deps: `snow`, `argon2`, `chacha20poly1305`, `blake2`, `zeroize`
 - [x] Password input: `rpassword` (interactive prompt) + `CHAT_RS_PASSWORD` env
 - [x] Logging: `tracing` + `tracing-subscriber`
-- [ ] TUI deps: `crossterm`, `ratatui` *(deferred — v0 uses plain stdin/stdout)*
+- [x] TUI deps: `crossterm` (event-stream feature) + `ratatui` 0.30 (`crossterm_0_29` feature pin so there's exactly one crossterm in the tree). Client uses an alt-screen TUI: status bar, scrolling room pane, input box; per-username color via a small palette; RAII terminal guard restores even on panic; ctrl-c is captured as a key event in raw mode
 - [x] Dev deps: none (`proptest` was added then removed; never imported)
 - [x] `cargo fmt` + `cargo clippy -- -D warnings` clean baseline
 
