@@ -57,3 +57,59 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrips<T: serde::Serialize + serde::de::DeserializeOwned>(v: &T) {
+        let bytes = postcard::to_stdvec(v).unwrap();
+        let back: T = postcard::from_bytes(&bytes).unwrap();
+        // Re-serialize since the enums lack PartialEq.
+        assert_eq!(postcard::to_stdvec(&back).unwrap(), bytes);
+    }
+
+    #[test]
+    fn client_frame_roundtrip() {
+        roundtrips(&ClientFrame::Hello {
+            username: "alice".into(),
+        });
+        roundtrips(&ClientFrame::Message {
+            ad: MessageAd {
+                from: Uuid::nil(),
+                timestamp_ms: 1234,
+            },
+            ciphertext: vec![1, 2, 3, 4],
+        });
+        roundtrips(&ClientFrame::Clear);
+    }
+
+    #[test]
+    fn server_frame_roundtrip() {
+        let rm = RoomMessage {
+            from: Uuid::nil(),
+            username: "alice".into(),
+            ad: MessageAd {
+                from: Uuid::nil(),
+                timestamp_ms: 1234,
+            },
+            ciphertext: vec![5, 6, 7],
+        };
+        roundtrips(&ServerFrame::Hello {
+            room_salt: [7u8; 32],
+            server_version: PROTOCOL_VERSION,
+        });
+        roundtrips(&ServerFrame::Welcome {
+            user_id: Uuid::nil(),
+            history: vec![rm.clone()],
+        });
+        roundtrips(&ServerFrame::Message(rm));
+        roundtrips(&ServerFrame::Cleared {
+            by: Uuid::nil(),
+            username: "alice".into(),
+        });
+        roundtrips(&ServerFrame::Error {
+            reason: ErrorKind::AuthFailed,
+        });
+    }
+}

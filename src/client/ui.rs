@@ -349,3 +349,88 @@ pub fn decrypt_to_display(room_key: &[u8; 32], m: &RoomMessage) -> DisplayMsg {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> UiState {
+        UiState::new(
+            "alice".into(),
+            Uuid::nil(),
+            "127.0.0.1:3000".parse().unwrap(),
+        )
+    }
+
+    fn sys(text: &str) -> DisplayMsg {
+        DisplayMsg {
+            ts_ms: 0,
+            kind: DisplayKind::System { text: text.into() },
+        }
+    }
+
+    #[test]
+    fn push_keeps_scroll_zero_when_pinned() {
+        let mut s = state();
+        s.last_inner_h = 5;
+        for i in 0..10 {
+            s.push(sys(&format!("m{i}")));
+        }
+        assert_eq!(s.scroll, 0, "auto-scroll should keep view pinned to latest");
+    }
+
+    #[test]
+    fn push_increments_scroll_when_scrolled() {
+        let mut s = state();
+        s.last_inner_h = 5;
+        for i in 0..10 {
+            s.push(sys(&format!("m{i}")));
+        }
+        s.scroll_up(3);
+        assert_eq!(s.scroll, 3);
+        s.push(sys("new"));
+        assert_eq!(
+            s.scroll, 4,
+            "new msg while scrolled bumps scroll to anchor view"
+        );
+    }
+
+    #[test]
+    fn clear_messages_resets_scroll() {
+        let mut s = state();
+        s.last_inner_h = 5;
+        for i in 0..20 {
+            s.push(sys(&format!("m{i}")));
+        }
+        s.scroll_up(10);
+        assert!(s.scroll > 0);
+        s.clear_messages();
+        assert_eq!(s.scroll, 0);
+        assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn cap_evicts_oldest() {
+        let mut s = state();
+        for i in 0..(HISTORY_CAP + 5) {
+            s.push(sys(&format!("m{i}")));
+        }
+        assert_eq!(s.messages.len(), HISTORY_CAP);
+        let DisplayKind::System { text } = &s.messages.front().unwrap().kind else {
+            panic!("expected System kind");
+        };
+        assert_eq!(text, "m5", "oldest 5 should have been evicted");
+    }
+
+    #[test]
+    fn scroll_clamps_to_max() {
+        let mut s = state();
+        s.last_inner_h = 5;
+        for i in 0..10 {
+            s.push(sys(&format!("m{i}")));
+        }
+        s.scroll_up(100);
+        // max scroll = len - inner_h = 10 - 5 = 5
+        assert_eq!(s.scroll, 5);
+    }
+}

@@ -59,7 +59,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] `ClientFrame::Hello { username }` after Noise handshake
 - [x] `ServerFrame::Welcome { user_id, history }` with last 15 ciphertexts replayed
 - [x] Broadcast: server forwards `RoomMessage` to all connected clients (including sender for echo confirmation)
-- [x] `Clear` command (sent as `/clear` from the client REPL) broadcasts `Cleared { by }`
+- [x] `Clear` command (sent as `/clear` from the client TUI input box) broadcasts `Cleared { by, username }`
 
 ## Phase 4 — Polish & safety
 
@@ -80,7 +80,12 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Dependency audit: per-dep purpose comment in `Cargo.toml`; trim `tokio` features from `"full"` to the actual subset used; drop unused `bytes` direct dep (`tokio_util::bytes::Bytes` works); drop unused `proptest` dev-dep
 - [x] Add `deny.toml` (cargo-deny: licenses, advisories, bans, sources — all four checks pass)
 - [x] Set `postcard = { default-features = false, features = ["use-std"] }` to drop the `heapless-cas` default → drops the unmaintained `atomic-polyfill` (RUSTSEC-2023-0089)
-- [ ] Test gaps to fill: (a) sweeper-driven idle eviction — would need an injectable timeout; (b) slow-peer broadcast — full-mpsc peer doesn't stall delivery to others; (c) `ad.from != user_id` is rejected with `Protocol`; (d) over-cap username is rejected; (e) duplicate `Hello` after auth is rejected
+- [x] UiState unit tests: pinned-push keeps `scroll == 0`; scrolled-push anchors view (`scroll` increments); `clear_messages` resets scroll; `HISTORY_CAP` evicts oldest; `scroll_up` clamps to `len - inner_h`
+- [x] Postcard wire round-trip for `ClientFrame` and `ServerFrame` (every variant, incl. `Cleared { by, username }`)
+- [x] Integration test: `ad.from != user_id` is rejected and the connection drops; server stays alive for new connects
+- [x] Integration test: over-cap `Hello.username` is rejected with `ServerFrame::Error { reason: BadFrame }`
+- [x] Integration test: duplicate `Hello` after auth drops the connection
+- [ ] Remaining test gaps (require small refactors): (a) sweeper-driven idle eviction — would need an injectable timeout; (b) slow-peer broadcast — full-mpsc peer doesn't stall delivery to others; (c) graceful-shutdown drain — needs a programmatic shutdown handle on `server::run`
 - [ ] Memoize the Noise pattern parse — currently `crypto/noise.rs::params()` re-parses `"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"` on every handshake and uses `.expect()` (the only `expect` in non-test code; infallible, but a `LazyLock<NoiseParams>` removes both the per-handshake work and the lone exception to the no-`expect` rule)
 
 ## Phase 5 — Open questions to resolve before 1.0

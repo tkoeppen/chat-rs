@@ -6,10 +6,10 @@ use chat_rs::crypto::noise::{
 };
 use chat_rs::crypto::password::derive_keys;
 use chat_rs::crypto::room;
-use chat_rs::error::Result;
+use chat_rs::error::{ErrorKind, Result};
 use chat_rs::proto::{
-    ClientFrame, HISTORY_LEN, MAX_FRAME_LEN, MessageAd, PROTOCOL_VERSION, RoomMessage, ServerFrame,
-    now_ms,
+    ClientFrame, HISTORY_LEN, MAX_FRAME_LEN, MAX_USERNAME_LEN, MessageAd, PROTOCOL_VERSION,
+    RoomMessage, ServerFrame, now_ms,
 };
 use chat_rs::server;
 use chat_rs::wire::{FramedStream, frame, recv_bytes, recv_postcard, send_bytes};
@@ -278,6 +278,97 @@ async fn oversized_frame_is_rejected() {
     .await;
     // Test passes if the server didn't OOM/panic; we don't strictly assert close here because
     // the server may have already written the hello before reading our header.
+}
+
+#[tokio::test]
+async fn ad_from_mismatch_drops_connection() {
+    let addr = ephemeral_addr().await;
+    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    wait_ready(addr).await;
+
+    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
+
+    // Build a Message with ad.from set to someone else's UUID — this would
+    // make peers' decrypts silently fail, so the server must reject loud.
+    let bogus = Uuid::new_v4();
+    let ad = MessageAd {
+        from: bogus,
+        timestamp_ms: now_ms(),
+    };
+    let ct = room::seal(&alice.room_key, b"spoof", &ad).unwrap();
+    send_encrypted(
+        &mut alice.framed,
+        &mut alice.transport,
+        &ClientFrame::Message { ad, ciphertext: ct },
+    )
+    .await
+    .unwrap();
+
+    let r = tokio::time::timeout(Duration::from_millis(500), recv_bytes(&mut alice.framed)).await;
+    assert!(
+        matches!(r, Ok(Err(_)) | Err(_)),
+        "server should drop the connection on ad.from mismatch"
+    );
+
+    // Server still alive — another client can connect.
+    let _bob = connect_client(addr, b"horse", "bob").await.unwrap();
+}
+
+#[tokio::test]
+async fn over_cap_username_rejected() {
+    let addr = ephemeral_addr().await;
+    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    wait_ready(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let mut framed = frame(sock);
+    let salt = match recv_postcard::<_, ServerFrame>(&mut framed).await.unwrap() {
+        ServerFrame::Hello { room_salt, .. } => room_salt,
+        _ => panic!("expected Hello"),
+    };
+    let keys = chat_rs::crypto::password::derive_keys(b"horse", &salt).unwrap();
+    let mut transport = handshake_initiator(&keys.psk, &mut framed).await.unwrap();
+
+    // 33 chars = MAX_USERNAME_LEN + 1
+    let big = "a".repeat(MAX_USERNAME_LEN + 1);
+    let pt = postcard::to_stdvec(&ClientFrame::Hello { username: big }).unwrap();
+    let ct = transport_seal(&mut transport, &pt).unwrap();
+    send_bytes(&mut framed, ct).await.unwrap();
+
+    let resp = tokio::time::timeout(Duration::from_secs(2), recv_bytes(&mut framed))
+        .await
+        .expect("server replied")
+        .expect("no read error");
+    let resp_pt = transport_open(&mut transport, &resp).unwrap();
+    let resp_frame: ServerFrame = postcard::from_bytes(&resp_pt).unwrap();
+    match resp_frame {
+        ServerFrame::Error { reason } => assert_eq!(reason, ErrorKind::BadFrame),
+        other => panic!("expected ServerFrame::Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn duplicate_hello_after_auth_drops_connection() {
+    let addr = ephemeral_addr().await;
+    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    wait_ready(addr).await;
+
+    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
+    send_encrypted(
+        &mut alice.framed,
+        &mut alice.transport,
+        &ClientFrame::Hello {
+            username: "alice2".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let r = tokio::time::timeout(Duration::from_millis(500), recv_bytes(&mut alice.framed)).await;
+    assert!(
+        matches!(r, Ok(Err(_)) | Err(_)),
+        "server should drop the connection on duplicate Hello"
+    );
 }
 
 #[tokio::test]
