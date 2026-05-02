@@ -167,13 +167,15 @@ When scrolled back, the room title shows `room (↑ scrolled N — End to return
 
 | Key | Action |
 | --- | --- |
-| Enter | Send message (or `/clear` command) |
+| Enter | Send message, or run a slash command |
 | Backspace | Delete previous char in input |
 | Char | Append to input |
 | ↑ / ↓ | Scroll back / forward 1 message |
 | PgUp / PgDn | Scroll back / forward nearly a full pane |
 | Home / End | Oldest visible / back to live |
 | Ctrl-C | Quit cleanly (terminal restored via RAII) |
+
+Slash commands: `/clear` or `/c` wipes room history for everyone (locally too); `/quit` or `/q` exits the client (same as Ctrl-C).
 
 ### State
 

@@ -42,7 +42,7 @@ Connect a client:
 chat-rs connect SERVER_IP 3000 username
 ```
 
-Inside the client TUI, `/clear` wipes the room history for everyone (locally too), and **Ctrl-C** quits cleanly.
+Inside the client TUI, `/clear` (or `/c`) wipes the room history for everyone (locally too), `/quit` (or `/q`) — or **Ctrl-C** — exits cleanly.
 
 ## Try it locally
 
@@ -75,11 +75,16 @@ Each client opens a small TUI (alt-screen, raw mode): centered **Secure Terminal
 
 | Key | Action |
 | --- | --- |
-| Enter | Send the current line (or `/clear`) |
+| Enter | Send the current line, or run a slash command |
 | ↑ / ↓ | Scroll the room pane 1 line |
 | PgUp / PgDn | Scroll nearly a full pane |
 | Home / End | Oldest visible / back to live |
 | Ctrl-C | Quit cleanly (terminal restored via RAII guard) |
+
+| Slash command | Action |
+| --- | --- |
+| `/clear` or `/c` | Wipe room history for everyone (locally too) |
+| `/quit` or `/q` | Exit cleanly (same as Ctrl-C) |
 
 Type a line in alice's window and hit **enter** — bob sees it as `[hh:mm:ss] alice: <message>` with usernames colored. The last 15 messages are replayed to anyone who joins later. Send `/clear` from either client to wipe the room history for everyone — the post-clear screen is a single `cleared by alice` notice.
 

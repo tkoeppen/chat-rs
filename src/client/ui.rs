@@ -175,7 +175,7 @@ pub fn render(f: &mut ratatui::Frame, state: &mut UiState) {
     f.render_widget(header, chunks[0]);
 
     let status = Paragraph::new(format!(
-        " {} · {}  —  enter · /clear · ↑↓/PgUp/PgDn scroll · End live · ctrl-c quit",
+        " {} · {}  —  enter to send · /(c)lear · /(q)uit · ↑↓/PgUp/PgDn scroll · End live",
         state.username, state.addr,
     ))
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
@@ -279,8 +279,10 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
             if trimmed.is_empty() {
                 return KeyAction::None;
             }
-            if trimmed == "/clear" {
-                return KeyAction::Send(ClientFrame::Clear);
+            match trimmed {
+                "/c" | "/clear" => return KeyAction::Send(ClientFrame::Clear),
+                "/q" | "/quit" => return KeyAction::Quit,
+                _ => {}
             }
             let ad = MessageAd {
                 from: state.user_id,
@@ -432,5 +434,32 @@ mod tests {
         s.scroll_up(100);
         // max scroll = len - inner_h = 10 - 5 = 5
         assert_eq!(s.scroll, 5);
+    }
+
+    fn submit(text: &str) -> KeyAction {
+        let mut s = state();
+        s.input = text.into();
+        handle_key(
+            &mut s,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &[0u8; 32],
+        )
+    }
+
+    #[test]
+    fn quit_aliases_exit() {
+        for cmd in ["/q", "/quit"] {
+            assert!(matches!(submit(cmd), KeyAction::Quit), "{cmd} should quit");
+        }
+    }
+
+    #[test]
+    fn clear_aliases_send_clear() {
+        for cmd in ["/c", "/clear"] {
+            assert!(
+                matches!(submit(cmd), KeyAction::Send(ClientFrame::Clear)),
+                "{cmd} should send Clear"
+            );
+        }
     }
 }
