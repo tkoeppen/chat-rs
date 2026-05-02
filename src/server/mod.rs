@@ -5,8 +5,10 @@
 
 pub mod managers;
 pub mod ratelimit;
+pub mod rooms;
 pub mod stores;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,68 +24,90 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::crypto::noise::{handshake_responder, recv_encrypted, send_encrypted};
+use crate::crypto::noise::{build_prologue, handshake_responder, recv_encrypted, send_encrypted};
 use crate::crypto::password::derive_keys;
 use crate::error::{Error, ErrorKind, Result};
-use crate::proto::{ClientFrame, MAX_USERNAME_LEN, PROTOCOL_VERSION, RoomMessage, ServerFrame};
-use crate::wire::{FramedStream, frame, send_postcard};
+use crate::proto::{
+    ClientFrame, MAX_ROOM_ID_LEN, MAX_USERNAME_LEN, PROTOCOL_VERSION, RoomMessage, ServerFrame,
+};
+use crate::wire::{FramedStream, frame, recv_postcard, send_postcard};
 
 use managers::ConnectionManager;
 use ratelimit::RateLimiter;
+use rooms::RoomConfig;
 use stores::{MessageStore, UserSessionStore};
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3600);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const OUTBOX_DEPTH: usize = 64;
-/// Time budget for the unauthenticated handshake phase (Noise M0/M1 + the
-/// first encrypted ClientFrame::Hello). Connections that don't complete in
-/// this window are dropped — closes the slow-loris vector against tasks/FDs.
+/// Time budget for the unauthenticated handshake phase (RoomSelect + Noise
+/// M0/M1 + the first encrypted ClientFrame::Hello). Connections that don't
+/// complete in this window are dropped — closes the slow-loris vector.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Per-IP connection cap inside `RATELIMIT_WINDOW`. Generous enough that a
-/// typical user with many tabs/sessions isn't blocked, low enough that a
-/// scripted flood from a single source is.
 const RATELIMIT_MAX: usize = 60;
 const RATELIMIT_WINDOW: Duration = Duration::from_secs(60);
 
-pub struct ServerState {
+pub type RoomId = String;
+
+/// Per-room server state. One `Arc<RoomState>` per room, shared by every
+/// connection in that room.
+pub struct RoomState {
+    pub room_id: RoomId,
     pub room_salt: [u8; 32],
-    /// Cached at startup. The password is derived once and then dropped, so an
-    /// unauthenticated TCP connect cannot trigger Argon2 work.
+    /// Noise PSK derived once at startup from the room's password + salt.
     pub psk: Zeroizing<[u8; 32]>,
     pub messages: Mutex<MessageStore>,
     pub sessions: Mutex<UserSessionStore>,
     pub connections: Mutex<ConnectionManager>,
+}
+
+/// Top-level server: a map of rooms + a global rate-limiter.
+pub struct ServerHub {
+    pub rooms: HashMap<RoomId, Arc<RoomState>>,
     pub ratelimit: RateLimiter,
 }
 
-impl ServerState {
-    pub fn new(password: &Zeroizing<Vec<u8>>) -> Result<Arc<Self>> {
-        let mut salt = [0u8; 32];
-        getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
-        let keys = derive_keys(password, &salt)?;
-        let psk = Zeroizing::new(keys.psk);
-        // `keys` (with room_key) drops here — zeroized.
+impl ServerHub {
+    /// Derives every room's PSK at startup. Each room's password is dropped
+    /// (zeroized) before this returns; the unauthenticated TCP path never
+    /// triggers Argon2.
+    pub fn new(configs: Vec<RoomConfig>) -> Result<Arc<Self>> {
+        let mut rooms = HashMap::with_capacity(configs.len());
+        for cfg in configs {
+            let mut salt = [0u8; 32];
+            getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
+            let pw = Zeroizing::new(cfg.password.into_bytes());
+            let keys = derive_keys(&pw, &salt)?;
+            let psk = Zeroizing::new(keys.psk);
+            // pw + keys (with room_key) drop here — both zeroized.
+            rooms.insert(
+                cfg.name.clone(),
+                Arc::new(RoomState {
+                    room_id: cfg.name,
+                    room_salt: salt,
+                    psk,
+                    messages: Mutex::new(MessageStore::new()),
+                    sessions: Mutex::new(UserSessionStore::new(SESSION_TIMEOUT)),
+                    connections: Mutex::new(ConnectionManager::new()),
+                }),
+            );
+        }
         Ok(Arc::new(Self {
-            room_salt: salt,
-            psk,
-            messages: Mutex::new(MessageStore::new()),
-            sessions: Mutex::new(UserSessionStore::new(SESSION_TIMEOUT)),
-            connections: Mutex::new(ConnectionManager::new()),
+            rooms,
             ratelimit: RateLimiter::new(RATELIMIT_MAX, RATELIMIT_WINDOW),
         }))
     }
 }
 
-pub async fn run(addr: SocketAddr, password: Zeroizing<Vec<u8>>) -> Result<()> {
-    let state = ServerState::new(&password)?;
-    drop(password);
+pub async fn run(addr: SocketAddr, configs: Vec<RoomConfig>) -> Result<()> {
+    let hub = ServerHub::new(configs)?;
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "listening");
+    info!(rooms = hub.rooms.len(), %addr, "listening");
 
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
-    tasks.spawn(sweeper(state.clone(), shutdown.clone()));
+    tasks.spawn(sweeper(hub.clone(), shutdown.clone()));
 
     loop {
         tokio::select! {
@@ -97,15 +121,15 @@ pub async fn run(addr: SocketAddr, password: Zeroizing<Vec<u8>>) -> Result<()> {
             res = listener.accept() => {
                 match res {
                     Ok((sock, peer)) => {
-                        if !state.ratelimit.check(peer.ip()) {
+                        if !hub.ratelimit.check(peer.ip()) {
                             warn!(%peer, "rate-limited; dropping connection");
                             drop(sock);
                             continue;
                         }
-                        let state = state.clone();
+                        let hub = hub.clone();
                         let shutdown = shutdown.clone();
                         tasks.spawn(async move {
-                            if let Err(e) = handle_connection(state, sock, peer, shutdown).await {
+                            if let Err(e) = handle_connection(hub, sock, peer, shutdown).await {
                                 warn!(%peer, error = %e, "connection error");
                             }
                         });
@@ -123,7 +147,7 @@ pub async fn run(addr: SocketAddr, password: Zeroizing<Vec<u8>>) -> Result<()> {
     Ok(())
 }
 
-async fn sweeper(state: Arc<ServerState>, shutdown: CancellationToken) {
+async fn sweeper(hub: Arc<ServerHub>, shutdown: CancellationToken) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.tick().await; // skip immediate fire
     loop {
@@ -131,29 +155,29 @@ async fn sweeper(state: Arc<ServerState>, shutdown: CancellationToken) {
             _ = shutdown.cancelled() => return,
             _ = ticker.tick() => {}
         }
-        let stale = {
-            let s = state.sessions.lock().await;
-            s.stale()
-        };
-        // Always sweep the rate-limiter so a churn of distinct IPs doesn't
-        // grow its HashMap unbounded.
-        state.ratelimit.cleanup();
-        if stale.is_empty() {
-            continue;
+        hub.ratelimit.cleanup();
+        for room in hub.rooms.values() {
+            let stale = {
+                let s = room.sessions.lock().await;
+                s.stale()
+            };
+            if stale.is_empty() {
+                continue;
+            }
+            let count = stale.len();
+            let mut sessions = room.sessions.lock().await;
+            let mut conns = room.connections.lock().await;
+            for id in stale {
+                sessions.remove(&id);
+                conns.remove(&id);
+            }
+            info!(room = %room.room_id, evicted = count, "sweeper evicted stale sessions");
         }
-        let count = stale.len();
-        let mut sessions = state.sessions.lock().await;
-        let mut conns = state.connections.lock().await;
-        for id in stale {
-            sessions.remove(&id);
-            conns.remove(&id);
-        }
-        info!(evicted = count, "sweeper evicted stale sessions");
     }
 }
 
 async fn handle_connection(
-    state: Arc<ServerState>,
+    hub: Arc<ServerHub>,
     sock: TcpStream,
     peer: SocketAddr,
     shutdown: CancellationToken,
@@ -161,33 +185,76 @@ async fn handle_connection(
     sock.set_nodelay(true).ok();
     let mut framed = frame(sock);
 
-    // Phase 0: plaintext server hello.
+    // Phase 0a: read RoomSelect (plaintext) under the handshake timeout.
+    let select: ClientFrame = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        recv_postcard::<_, ClientFrame>(&mut framed),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            warn!(%peer, "client did not send RoomSelect in time");
+            return Err(Error::Protocol("room select timeout"));
+        }
+    };
+    let room_name = match select {
+        ClientFrame::RoomSelect { room } => room,
+        _ => return Err(Error::Protocol("expected RoomSelect")),
+    };
+    if room_name.is_empty() || room_name.len() > MAX_ROOM_ID_LEN {
+        let _ = send_postcard(
+            &mut framed,
+            &ServerFrame::Error {
+                reason: ErrorKind::BadFrame,
+            },
+        )
+        .await;
+        return Err(Error::Protocol("invalid room name length"));
+    }
+    // Look up room. Reply with AuthFailed (not a more specific error) on miss
+    // so an attacker can't enumerate room names.
+    let room = match hub.rooms.get(&room_name).cloned() {
+        Some(r) => r,
+        None => {
+            let _ = send_postcard(
+                &mut framed,
+                &ServerFrame::Error {
+                    reason: ErrorKind::AuthFailed,
+                },
+            )
+            .await;
+            warn!(%peer, room = %room_name, "unknown room");
+            return Err(Error::Protocol("unknown room"));
+        }
+    };
+
+    // Phase 0b: send the room's plaintext server hello.
     send_postcard(
         &mut framed,
         &ServerFrame::Hello {
-            room_salt: state.room_salt,
+            room_salt: room.room_salt,
             server_version: PROTOCOL_VERSION,
         },
     )
     .await?;
 
-    // Phase 1: Noise NNpsk0 handshake using the pre-derived psk. The salt is
-    // bound into the Noise prologue so MITM tampering with the plaintext
-    // server-hello fails immediately on M0 instead of after Argon2 work.
-    // Wrapped in a timeout to close the slow-loris vector.
+    // Phase 1: Noise NNpsk0 with prologue = (room_id, room_salt). Wrapped in
+    // a timeout to close the slow-loris vector.
+    let prologue = build_prologue(&room.room_id, &room.room_salt);
     let mut transport = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        handshake_responder(&state.psk, &state.room_salt, &mut framed),
+        handshake_responder(&room.psk, &prologue, &mut framed),
     )
     .await
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
-            warn!(%peer, error = %e, "handshake failed");
+            warn!(%peer, room = %room.room_id, error = %e, "handshake failed");
             return Err(e);
         }
         Err(_) => {
-            warn!(%peer, "handshake timed out");
+            warn!(%peer, room = %room.room_id, "handshake timed out");
             return Err(Error::Protocol("handshake timeout"));
         }
     };
@@ -201,7 +268,7 @@ async fn handle_connection(
     {
         Ok(r) => r?,
         Err(_) => {
-            warn!(%peer, "client did not send Hello in time");
+            warn!(%peer, room = %room.room_id, "client did not send Hello in time");
             return Err(Error::Protocol("hello timeout"));
         }
     };
@@ -237,15 +304,15 @@ async fn handle_connection(
     let (tx, mut rx) = mpsc::channel::<ServerFrame>(OUTBOX_DEPTH);
 
     {
-        let mut sessions = state.sessions.lock().await;
+        let mut sessions = room.sessions.lock().await;
         sessions.insert(user_id, username.clone());
-        let mut conns = state.connections.lock().await;
+        let mut conns = room.connections.lock().await;
         conns.insert(user_id, tx);
     }
-    info!(%peer, %user_id, %username, "connected");
+    info!(%peer, room = %room.room_id, %user_id, %username, "connected");
 
     let history = {
-        let m = state.messages.lock().await;
+        let m = room.messages.lock().await;
         m.snapshot()
     };
     send_encrypted(
@@ -256,7 +323,7 @@ async fn handle_connection(
     .await?;
 
     let result = pump(
-        &state,
+        &room,
         user_id,
         &username,
         &mut framed,
@@ -267,17 +334,17 @@ async fn handle_connection(
     .await;
 
     {
-        let mut sessions = state.sessions.lock().await;
+        let mut sessions = room.sessions.lock().await;
         sessions.remove(&user_id);
-        let mut conns = state.connections.lock().await;
+        let mut conns = room.connections.lock().await;
         conns.remove(&user_id);
     }
-    info!(%peer, %user_id, %username, "disconnected");
+    info!(%peer, room = %room.room_id, %user_id, %username, "disconnected");
     result
 }
 
 async fn pump<S>(
-    state: &Arc<ServerState>,
+    room: &Arc<RoomState>,
     user_id: Uuid,
     username: &str,
     framed: &mut FramedStream<S>,
@@ -306,28 +373,27 @@ where
                 };
                 let pt = crate::crypto::noise::transport_open(transport, &bytes)?;
                 let msg: ClientFrame = postcard::from_bytes(&pt)?;
-                handle_client_frame(state, user_id, username, msg).await?;
+                handle_client_frame(room, user_id, username, msg).await?;
             }
         }
     }
 }
 
 async fn handle_client_frame(
-    state: &Arc<ServerState>,
+    room: &Arc<RoomState>,
     user_id: Uuid,
     username: &str,
     msg: ClientFrame,
 ) -> Result<()> {
     {
-        let mut sessions = state.sessions.lock().await;
+        let mut sessions = room.sessions.lock().await;
         sessions.touch(user_id);
     }
     match msg {
-        ClientFrame::Hello { .. } => Err(Error::Protocol("duplicate Hello")),
+        ClientFrame::RoomSelect { .. } | ClientFrame::Hello { .. } => {
+            Err(Error::Protocol("unexpected handshake frame after auth"))
+        }
         ClientFrame::Message { ad, ciphertext } => {
-            // Validate the bound metadata. ad.from / ad.username are checked
-            // here, and ad.counter must strictly increase (replay protection).
-            // All three failures are protocol violations → drop the connection.
             if ad.from != user_id {
                 return Err(Error::Protocol("ad.from does not match session user_id"));
             }
@@ -335,7 +401,7 @@ async fn handle_client_frame(
                 return Err(Error::Protocol("ad.username does not match session"));
             }
             {
-                let mut sessions = state.sessions.lock().await;
+                let mut sessions = room.sessions.lock().await;
                 if !sessions.try_advance_counter(user_id, ad.counter) {
                     return Err(Error::Protocol("ad.counter not strictly increasing"));
                 }
@@ -347,19 +413,19 @@ async fn handle_client_frame(
                 ciphertext,
             };
             {
-                let mut m = state.messages.lock().await;
+                let mut m = room.messages.lock().await;
                 m.push(room_msg.clone());
             }
-            broadcast(state, ServerFrame::Message(room_msg)).await;
+            broadcast(room, ServerFrame::Message(room_msg)).await;
             Ok(())
         }
         ClientFrame::Clear => {
             {
-                let mut m = state.messages.lock().await;
+                let mut m = room.messages.lock().await;
                 m.clear();
             }
             broadcast(
-                state,
+                room,
                 ServerFrame::Cleared {
                     by: user_id,
                     username: username.to_string(),
@@ -371,12 +437,12 @@ async fn handle_client_frame(
     }
 }
 
-/// Broadcast a frame to all connected peers. Uses `try_send` so a slow or stuck
-/// peer cannot head-of-line block delivery to everyone else; full or closed
+/// Broadcast a frame to all connected peers in this room. Uses `try_send` so a
+/// slow or stuck peer cannot head-of-line block delivery; full or closed
 /// outboxes are evicted.
-async fn broadcast(state: &Arc<ServerState>, frame_out: ServerFrame) {
+async fn broadcast(room: &Arc<RoomState>, frame_out: ServerFrame) {
     let snapshot = {
-        let conns = state.connections.lock().await;
+        let conns = room.connections.lock().await;
         conns.snapshot()
     };
     let mut dead = Vec::new();
@@ -388,10 +454,10 @@ async fn broadcast(state: &Arc<ServerState>, frame_out: ServerFrame) {
     }
     if !dead.is_empty() {
         let dead_count = dead.len();
-        let mut conns = state.connections.lock().await;
+        let mut conns = room.connections.lock().await;
         for id in dead {
             conns.remove(&id);
         }
-        debug!(evicted = dead_count, "broadcast evicted slow or dead peers");
+        debug!(room = %room.room_id, evicted = dead_count, "broadcast evicted slow or dead peers");
     }
 }

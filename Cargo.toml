@@ -61,6 +61,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 getrandom = "0.4"
 # Interactive password prompt (no echo) when `CHAT_RS_PASSWORD` is unset.
 rpassword = "7"
+# Loads `.env` from the working directory at startup so all `CHAT_RS_*`
+# config (bind addr, rooms, server, username, room, password) lives in one
+# file. Existing process env wins over `.env` entries.
+dotenvy = "0.15"
 # Terminal raw I/O for the TUI client (keys, alt-screen). `event-stream` gives
 # an async Stream that integrates with the tokio::select! main loop.
 crossterm = { version = "0.29", features = ["event-stream"] }

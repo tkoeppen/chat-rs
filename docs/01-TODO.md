@@ -36,8 +36,8 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 
 ## Phase 1 — CLI + transport skeleton
 
-- [x] `serve <ip> <port>` subcommand — `CHAT_RS_PASSWORD` env, fall back to interactive prompt via `rpassword` (the `--password` flag was dropped)
-- [x] `connect <ip> <port> <username>` subcommand — same password-source rules
+- [x] `serve` subcommand — bind addr from `CHAT_RS_BIND` (`ip:port`), rooms from `CHAT_RS_ROOMS`. Password (per-room) read from `CHAT_RS_PASSWORD` if set, else interactive `rpassword` prompt; the `--password` flag was never added
+- [x] `connect` subcommand — server addr from `CHAT_RS_SERVER`, identity from `CHAT_RS_USERNAME` + `CHAT_RS_ROOM`, password via the same `CHAT_RS_PASSWORD`-or-prompt rule. All `CHAT_RS_*` vars auto-loaded from a `.env` in cwd via `dotenvy`; process env wins over file. Subcommand is the only positional argument; no `--flag` config args
 - [x] TCP listener + per-connection `tokio` task
 - [x] `LengthDelimitedCodec` with `max_frame_length(65536)`
 - [x] Plaintext `ServerFrame::Hello { room_salt, server_version }` as the very first frame on every connection (server generates `room_salt` once at startup)
@@ -90,6 +90,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Integration test: `ad.from != user_id` is rejected and the connection drops; server stays alive for new connects
 - [x] Integration test: over-cap `Hello.username` is rejected with `ServerFrame::Error { reason: BadFrame }`
 - [x] Integration test: duplicate `Hello` after auth drops the connection
+- [x] Env-var-only CLI. All config (`CHAT_RS_BIND`, `CHAT_RS_ROOMS`, `CHAT_RS_SERVER`, `CHAT_RS_USERNAME`, `CHAT_RS_ROOM`, `CHAT_RS_PASSWORD`) lives in env; `dotenvy` auto-loads `.env` from cwd at startup; process env wins over file. Removed positional args (`<ip> <port> <username> <room>`) and the `--rooms-config` flag — the subcommand (`serve` / `connect`) is the only positional. New `Error::MissingEnv(&'static str)` for clear diagnostics. `.env.example` ships as a runnable local setup
 - [ ] Remaining test gaps (require small refactors): (a) sweeper-driven idle eviction — would need an injectable timeout; (b) slow-peer broadcast — full-mpsc peer doesn't stall delivery to others; (c) graceful-shutdown drain — needs a programmatic shutdown handle on `server::run`
 - [ ] Memoize the Noise pattern parse — currently `crypto/noise.rs::params()` re-parses `"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"` on every handshake and uses `.expect()` (the only `expect` in non-test code; infallible, but a `LazyLock<NoiseParams>` removes both the per-handshake work and the lone exception to the no-`expect` rule)
 
@@ -109,6 +110,19 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
   - **Tentative recommendation: defer full ratchet, ship Option 3 (salt rotation) as the 1.0 forward-secrecy story.** Best value-per-line; fits the existing server-mints-salt design; avoids per-sender state machines. Open sub-decisions if Option 3 lands: rotation interval, behavior on rotation mid-message, history-replay semantics across an epoch boundary.
 - [x] KDF swap (HKDF-SHA256 → keyed BLAKE2s); `hkdf` + `sha2` direct deps dropped
 - [ ] Protocol-version negotiation — add a client version field if server-side gating ever matters
+- [x] Multi-room support — landed (closed model). `ServerHub` holds `HashMap<RoomId, Arc<RoomState>>`; per-room PSK / messages / sessions / connections. New pre-Noise `ClientFrame::RoomSelect { room }`; Noise prologue binds `(room_id, room_salt)` to prevent cross-room MITM shuffling. Rooms come from the `CHAT_RS_ROOMS` env var (multi-line `name = password`); the client picks one at connect time via `CHAT_RS_ROOM`. Two new e2e tests (`rooms_are_isolated`, `unknown_room_rejected`) plus 5 unit tests in `server/rooms.rs`. Wire-incompatible.
+  - **Current state.** One server = one room. Single PSK + `room_key` derived at startup from one password + salt; broadcast goes to every connected client.
+  - **Forks:**
+    1. **Closed (pre-configured rooms).** Server starts with `--room name=password` (repeatable) or a config file. All Argon2 work at startup, one PSK per room. DoS-safe.
+    2. **Open (any client creates).** Server does Argon2 lazily on first connect to an unknown room — re-introduces the per-connect 64 MiB DoS we just removed. Would need IP-keyed creation rate-limit + optional out-of-band token.
+  - **Tentative recommendation: closed model first.** Matches the rest of the security posture; can layer open rooms later if needed.
+  - **Wire change:** new pre-Noise plaintext `ClientFrame::RoomSelect { room: String }` from the client; server replies with that room's `ServerFrame::Hello { room_salt, server_version }`; handshake proceeds. Noise prologue binds `(room_id, room_salt)` not just `room_salt`, so MITM can't shuffle a client between rooms.
+  - **Server restructure:** `ServerState` → `ServerHub` (top-level: `rooms: HashMap<RoomId, Arc<RoomState>>`, global `RateLimiter`, listener, shutdown) + `RoomState` (per-room PSK / `MessageStore` / `UserSessionStore` / `ConnectionManager`).
+  - **CLI:** rooms hosted by the server come from the `CHAT_RS_ROOMS` env var (multi-line `name = password`); the client picks one at connect time via `CHAT_RS_ROOM`. (Originally planned as `--room name=password` (repeatable) / `--rooms-config <file>` on `serve` and a positional `<room>` on `connect`; superseded by the env-var-only CLI in the follow-up dotenvy migration.)
+  - **TUI:** status bar shows room name; optional `/room <name>` switcher in a follow-up iteration.
+  - **Effort:** ~1.5 days closed; +0.5 day for in-session switching; +2 days for the open model.
+  - **Side effect:** per-room salt rotation becomes the natural Phase 5 forward-secrecy implementation; the two items merge.
+  - **Doc fallout:** `FEATURES.md` non-goal "Multi-room routing — one server, one shared room" must be removed when implemented.
 
 ## Improvements applied vs initial draft (rationale)
 

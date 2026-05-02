@@ -10,6 +10,9 @@ use chat_rs::cli::{Cli, run};
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     disable_core_dumps();
+    // Load .env from cwd if present. Existing process env wins, so a
+    // CHAT_RS_PASSWORD passed inline overrides a placeholder in .env.
+    let _ = dotenvy::dotenv();
     init_tracing();
     let cli = Cli::parse();
     match run(cli).await {

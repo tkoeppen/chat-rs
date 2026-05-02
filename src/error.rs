@@ -42,6 +42,9 @@ pub enum Error {
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
 
+    #[error("missing required env var: {0}")]
+    MissingEnv(&'static str),
+
     #[error("server reported error: {0:?}")]
     Server(ErrorKind),
 }

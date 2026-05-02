@@ -33,6 +33,7 @@ pub struct UiState {
     pub username: String,
     pub user_id: Uuid,
     pub addr: SocketAddr,
+    pub room: String,
     pub input: String,
     pub messages: VecDeque<DisplayMsg>,
     /// Number of messages below the bottom of the visible window.
@@ -67,11 +68,12 @@ pub enum KeyAction {
 }
 
 impl UiState {
-    pub fn new(username: String, user_id: Uuid, addr: SocketAddr) -> Self {
+    pub fn new(username: String, user_id: Uuid, addr: SocketAddr, room: String) -> Self {
         Self {
             username,
             user_id,
             addr,
+            room,
             input: String::new(),
             messages: VecDeque::with_capacity(HISTORY_CAP),
             scroll: 0,
@@ -195,8 +197,8 @@ pub fn render(f: &mut ratatui::Frame, state: &mut UiState) {
     f.render_widget(header, chunks[0]);
 
     let status = Paragraph::new(format!(
-        " {} · {}  —  enter to send · /(c)lear · /(q)uit · ↑↓/PgUp/PgDn scroll · End live",
-        state.username, state.addr,
+        " {} · #{} · {}  —  enter to send · /(c)lear · /(q)uit · ↑↓/PgUp/PgDn scroll · End live",
+        state.username, state.room, state.addr,
     ))
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
     f.render_widget(status, chunks[1]);
@@ -385,6 +387,7 @@ mod tests {
             "alice".into(),
             Uuid::nil(),
             "127.0.0.1:3000".parse().unwrap(),
+            "main".into(),
         )
     }
 

@@ -9,11 +9,24 @@ pub const HISTORY_LEN: usize = 15;
 /// Bound on `ClientFrame::Hello { username }`. Keeps a misbehaving client from
 /// amplifying broadcast and history memory by sending huge usernames.
 pub const MAX_USERNAME_LEN: usize = 32;
+/// Bound on `ClientFrame::RoomSelect { room }`. Same rationale as
+/// MAX_USERNAME_LEN; also prevents oversized HashMap key churn server-side.
+pub const MAX_ROOM_ID_LEN: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientFrame {
-    Hello { username: String },
-    Message { ad: MessageAd, ciphertext: Vec<u8> },
+    /// Pre-Noise plaintext frame: client tells the server which room it wants.
+    /// Server uses this to look up the room's PSK before sending its Hello.
+    RoomSelect {
+        room: String,
+    },
+    Hello {
+        username: String,
+    },
+    Message {
+        ad: MessageAd,
+        ciphertext: Vec<u8>,
+    },
     Clear,
 }
 
@@ -78,6 +91,9 @@ mod tests {
 
     #[test]
     fn client_frame_roundtrip() {
+        roundtrips(&ClientFrame::RoomSelect {
+            room: "main".into(),
+        });
         roundtrips(&ClientFrame::Hello {
             username: "alice".into(),
         });

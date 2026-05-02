@@ -8,6 +8,22 @@ use crate::wire::{FramedStream, recv_bytes, send_bytes};
 const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const NOISE_BUF: usize = 65535;
 
+/// Build the Noise prologue from `(room_id, room_salt)`. Length-prefixing the
+/// room id prevents an `id || salt` ambiguity (room "ab" + salt "cdef…" would
+/// otherwise hash the same as room "abcd" + salt "ef…"). Both sides MUST call
+/// this with the same inputs or the handshake fails on M0.
+pub fn build_prologue(room_id: &str, salt: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + room_id.len() + 32);
+    debug_assert!(
+        room_id.len() <= u8::MAX as usize,
+        "room_id capped elsewhere"
+    );
+    v.push(room_id.len() as u8);
+    v.extend_from_slice(room_id.as_bytes());
+    v.extend_from_slice(salt);
+    v
+}
+
 fn params() -> NoiseParams {
     PATTERN.parse().expect("static noise pattern")
 }

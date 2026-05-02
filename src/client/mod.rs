@@ -13,18 +13,28 @@ use ratatui::Frame;
 use tokio::net::TcpStream;
 use zeroize::Zeroizing;
 
-use crate::crypto::noise::{handshake_initiator, recv_encrypted, send_encrypted, transport_open};
+use crate::crypto::noise::{
+    build_prologue, handshake_initiator, recv_encrypted, send_encrypted, transport_open,
+};
 use crate::crypto::password::derive_keys;
 use crate::error::{Error, Result};
 use crate::proto::{ClientFrame, PROTOCOL_VERSION, ServerFrame};
-use crate::wire::{FramedStream, frame, recv_postcard};
+use crate::wire::{FramedStream, frame, recv_postcard, send_postcard};
 
 use ui::{KeyAction, TerminalGuard, UiState};
 
-pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>>) -> Result<()> {
+pub async fn run(
+    addr: SocketAddr,
+    username: String,
+    room: String,
+    password: Zeroizing<Vec<u8>>,
+) -> Result<()> {
     let sock = TcpStream::connect(addr).await?;
     sock.set_nodelay(true).ok();
     let mut framed = frame(sock);
+
+    // Pre-Noise plaintext frame: tell the server which room we want.
+    send_postcard(&mut framed, &ClientFrame::RoomSelect { room: room.clone() }).await?;
 
     let hello: ServerFrame = recv_postcard(&mut framed).await?;
     let (room_salt, server_version) = match hello {
@@ -32,6 +42,7 @@ pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>
             room_salt,
             server_version,
         } => (room_salt, server_version),
+        ServerFrame::Error { reason } => return Err(Error::Server(reason)),
         _ => return Err(Error::Protocol("expected ServerFrame::Hello")),
     };
     if server_version != PROTOCOL_VERSION {
@@ -40,9 +51,10 @@ pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>
 
     let keys = derive_keys(&password, &room_salt)?;
     drop(password);
-    // Salt is bound into the Noise prologue: MITM tampering with the plaintext
-    // server-hello fails on M0 instead of after the handshake completes.
-    let mut transport = handshake_initiator(&keys.psk, &room_salt, &mut framed).await?;
+    // Prologue binds (room_id, room_salt): MITM tampering with the plaintext
+    // server-hello — or shuffling a client between rooms — fails on M0.
+    let prologue = build_prologue(&room, &room_salt);
+    let mut transport = handshake_initiator(&keys.psk, &prologue, &mut framed).await?;
     let room_key = Zeroizing::new(keys.room_key);
     drop(keys);
 
@@ -62,7 +74,7 @@ pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>
         _ => return Err(Error::Protocol("expected ServerFrame::Welcome")),
     };
 
-    let mut state = UiState::new(username, user_id, addr);
+    let mut state = UiState::new(username, user_id, addr, room);
     for m in &history {
         // Seed seen_counters from the replayed history so the next live
         // message from each sender must strictly exceed what we saw here.

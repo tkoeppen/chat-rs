@@ -19,16 +19,17 @@ For the in-flight checklist, see [`01-TODO.md`](01-TODO.md). This document is th
 - User registration, accounts, federation.
 - TLS termination in-process (run behind a reverse proxy if needed).
 - File transfer, voice, presence beyond connect/disconnect.
-- Multi-room routing — one server, one shared room.
 
 ## CLI
 
 ```sh
-chat-rs serve   <ip> <port>
-chat-rs connect <ip> <port> <username>
+chat-rs serve     # reads CHAT_RS_BIND, CHAT_RS_ROOMS
+chat-rs connect   # reads CHAT_RS_SERVER, CHAT_RS_USERNAME, CHAT_RS_ROOM, CHAT_RS_PASSWORD
 ```
 
-The password is read from the `CHAT_RS_PASSWORD` environment variable if set, otherwise from an interactive prompt (`rpassword`, no echo). There is **no** `--password` flag — passwords on the command line leak into shell history and `ps`.
+All configuration is read from environment variables. A `.env` file in the working directory is auto-loaded at startup via `dotenvy`; process env wins over `.env`, so an inline override of `CHAT_RS_PASSWORD` beats a placeholder in the file. See `.env.example` in the repo root for the full set.
+
+`CHAT_RS_BIND` and `CHAT_RS_SERVER` are `ip:port` strings (parsed by `SocketAddr::parse`). `CHAT_RS_ROOMS` is a multi-line value with one `name = password` per line, `[A-Za-z0-9_-]{1,32}` names, ≥ 8-char passwords, `#` comments. The client picks one room at connect time via `CHAT_RS_ROOM`. The password is read from `CHAT_RS_PASSWORD` if set, otherwise from an interactive prompt (`rpassword`, no echo). There are **no** positional or `--flag` config arguments — passwords on the command line leak into shell history and `ps`, and concentrating all config in one mechanism removes a class of "where does this come from" surprises.
 
 ## Cryptographic design
 
@@ -46,13 +47,15 @@ The password is read from the `CHAT_RS_PASSWORD` environment variable if set, ot
 
 ### Connection setup
 
-Two phases: one plaintext server-hello frame, then a Noise NNpsk0 handshake.
+Three phases: a plaintext room-select frame from the client, a plaintext server-hello with that room's salt, then a Noise NNpsk0 handshake bound to `(room_id, room_salt)`.
 
-**Phase 0 — Server hello (plaintext):**
+**Phase 0a — Room select (plaintext, client → server):**
 
-Server sends a single length-prefixed frame: `postcard(ServerFrame::Hello { room_salt, server_version })`. `room_salt` is non-secret (an Argon2 stretching salt, not a key), so sending it in the clear is fine — and it avoids the chicken-and-egg of needing `room_salt` to derive the PSK *before* the Noise handshake begins.
+`postcard(ClientFrame::RoomSelect { room: String })`. The room name is plaintext (server can't pick a PSK otherwise; room *names* are not secrets, passwords are). The server validates the name against `MAX_ROOM_ID_LEN`, looks up the room, and replies with either the room's hello (next phase) or `ServerFrame::Error { reason: AuthFailed }` for unknown rooms (deliberately indistinguishable from "wrong password later", so an attacker can't enumerate room names).
 
-The server generates `room_salt` once at startup (32 random bytes) and reuses it for the process lifetime. Restarting the server rotates the salt, which forces every client to re-stretch its password.
+**Phase 0b — Server hello (plaintext, server → client):**
+
+`postcard(ServerFrame::Hello { room_salt, server_version })`. `room_salt` is non-secret (an Argon2 stretching salt, not a key). The server generates one salt per room at startup (32 random bytes) and reuses it for the process lifetime; restarting the server rotates every room's salt.
 
 ### Key schedule
 
@@ -92,6 +95,7 @@ Inner (after Noise transport decrypt): `postcard`-encoded enum.
 
 ```rust
 enum ClientFrame {
+    RoomSelect { room: String },                      // pre-Noise plaintext, capped at MAX_ROOM_ID_LEN = 32
     Hello { username: String },                       // username capped at MAX_USERNAME_LEN = 32
     Message { ad: MessageAd, ciphertext: Vec<u8> },   // XChaCha20-Poly1305 over room_key
     Clear,
@@ -140,15 +144,16 @@ ciphertext = XChaCha20Poly1305::seal(room_key, nonce, plaintext, ad)
 ## Connection lifecycle
 
 1. TCP connect.
-2. Server sends `ServerFrame::Hello { room_salt, server_version }` (plaintext, length-prefixed).
-3. Client stretches password → `master`, splits → `psk` + `room_key`. If `server_version` is incompatible the client closes immediately.
-4. Noise NNpsk0 handshake (M0 from client, M1 from server). Wrong PSK → AEAD tag fails on first transport message → both sides close.
-5. Client sends `ClientFrame::Hello { username }` (Noise-encrypted). Server validates `1 ≤ len ≤ MAX_USERNAME_LEN`.
-6. Server replies `ServerFrame::Welcome { user_id, history }` with up to **15** prior `RoomMessage`s for the join replay.
-7. Bidirectional message flow until disconnect. Broadcast uses `try_send` + evict on `Full`/`Closed` so a slow peer cannot head-of-line block delivery.
-8. Idle sessions evicted after **3600 s** of inactivity; sweeper runs every **300 s**.
-9. On disconnect: drop sender, zeroize session keys, evict from `ConnectionManager`.
-10. **Graceful shutdown:** server's accept loop, sweeper, and per-connection `pump` all share a `tokio_util::sync::CancellationToken`. SIGINT cancels the token; the `JoinSet` drains in-flight tasks; once empty, `Arc<ServerState>` refcount hits zero and the cached `psk` zeroizes. Client catches ctrl-c as a key event in raw mode (the TUI swallows the SIGINT) and returns from its event loop, dropping `room_key`.
+2. Client sends `ClientFrame::RoomSelect { room }` (plaintext, length-prefixed). Server validates the name and looks it up; on miss it replies `ServerFrame::Error { reason: AuthFailed }` and closes.
+3. Server sends `ServerFrame::Hello { room_salt, server_version }` for that room (plaintext).
+4. Client stretches password → `master`, splits → `psk` + `room_key`. If `server_version` is incompatible the client closes immediately.
+5. Noise NNpsk0 handshake (M0 from client, M1 from server) with prologue = `len(room_id) || room_id || room_salt`. Wrong PSK → AEAD tag fails on first transport message → both sides close.
+6. Client sends `ClientFrame::Hello { username }` (Noise-encrypted). Server validates `1 ≤ len ≤ MAX_USERNAME_LEN`.
+7. Server replies `ServerFrame::Welcome { user_id, history }` with up to **15** prior `RoomMessage`s for the join replay (per-room).
+8. Bidirectional message flow until disconnect. Broadcast (per-room) uses `try_send` + evict on `Full`/`Closed` so a slow peer cannot head-of-line block delivery.
+9. Idle sessions evicted after **3600 s** of inactivity; sweeper runs every **300 s** and iterates every room.
+10. On disconnect: drop sender, zeroize session keys, evict from the room's `ConnectionManager`.
+11. **Graceful shutdown:** server's accept loop, sweeper, and per-connection `pump` all share a `tokio_util::sync::CancellationToken`. SIGINT cancels the token; the `JoinSet` drains in-flight tasks; once empty, every `Arc<RoomState>` refcount hits zero and each cached `psk` zeroizes. Client catches ctrl-c as a key event in raw mode (the TUI swallows the SIGINT) and returns from its event loop, dropping `room_key`.
 
 ## Client TUI
 
@@ -198,7 +203,7 @@ Slash commands: `/clear` or `/c` wipes room history for everyone (locally too); 
 src/
   main.rs               // entrypoint: clap parse → cli::run + tracing init
   lib.rs                // re-exports for integration tests
-  cli.rs                // clap derive + dispatch + read_password
+  cli.rs                // clap subcommand dispatch + CHAT_RS_* env lookups + read_password
   proto.rs              // postcard frame enums; PROTOCOL_VERSION; MAX_FRAME_LEN; MAX_USERNAME_LEN; HISTORY_LEN
   wire.rs               // LengthDelimitedCodec + send_postcard / recv_postcard helpers
   error.rs              // thiserror Error + ErrorKind
@@ -208,7 +213,8 @@ src/
     room.rs             // XChaCha20-Poly1305 wrappers (seal/open)
     noise.rs            // snow Noise NNpsk0 handshake + transport helpers
   server/
-    mod.rs              // listener, handle_connection, pump, broadcast, sweeper, shutdown
+    mod.rs              // ServerHub + per-RoomState; listener, handle_connection, pump, broadcast, sweeper, shutdown
+    rooms.rs            // RoomConfig + parser for the CHAT_RS_ROOMS env var
     stores.rs           // MessageStore (ring buffer), UserSessionStore (idle eviction + per-session counter)
     managers.rs         // ConnectionManager (mpsc::Sender map per session)
     ratelimit.rs        // per-source-IP sliding-window connection cap
@@ -216,7 +222,7 @@ src/
     mod.rs              // connect, handshake, event_loop orchestration
     ui.rs               // ratatui TUI: UiState, render, handle_key, TerminalGuard
 tests/
-  end_to_end.rs         // 10 integration tests (handshake, history, /clear, oversized, ad.from, username cap, dup Hello, …)
+  end_to_end.rs         // 12 integration tests (handshake, history, /clear, oversized, ad.from, username cap, dup Hello, room isolation, unknown room, …)
 ```
 
 ## Dependencies
@@ -226,7 +232,7 @@ See `Cargo.toml` for the canonical list; each direct dep has a one-line purpose 
 ```text
 Async/transport:   tokio (trimmed features), tokio-util (codec + sync),
                    futures-util (sink+std)
-CLI / I/O:         clap (derive), rpassword
+CLI / I/O:         clap (derive), rpassword, dotenvy (.env loader)
 Wire / serde:      serde (derive), postcard (use-std, default-features=false)
 Crypto:            snow, argon2, chacha20poly1305, blake2, zeroize, getrandom
 Errors:            thiserror
@@ -261,7 +267,7 @@ The Python references skip these; chat-rs enforces them:
 
 ## Testing
 
-**24 unit + 10 integration = 34 tests.**
+**29 unit + 12 integration = 41 tests.**
 
 - Unit (in-tree):
   - `crypto/password.rs` (4) — KDF determinism, password sensitivity, salt sensitivity, label separation.
@@ -269,9 +275,10 @@ The Python references skip these; chat-rs enforces them:
   - `crypto/noise.rs` (3) — handshake round-trip, wrong PSK fails, prologue mismatch fails.
   - `server/stores.rs` (1) — history ring-buffer cap.
   - `server/ratelimit.rs` (3) — below-limit allowed, distinct IPs independent, cleanup drops empty.
+  - `server/rooms.rs` (5) — parses two rooms with comments, rejects short password, rejects invalid name, rejects duplicate room, rejects empty config.
   - `proto.rs` (2) — postcard round-trip for every variant of `ClientFrame` and `ServerFrame`.
   - `client/ui.rs` (7) — pinned-push keeps scroll 0, scrolled-push anchors view, `clear_messages` resets scroll, `HISTORY_CAP` evicts oldest, scroll clamps to max, `/q`+`/quit` exit, `/c`+`/clear` send Clear.
-- Integration (`tests/end_to_end.rs`, 10): two-client message exchange (asserts plaintext does not appear in broadcast bytes), wrong-password failure, history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, over-cap username rejected with `BadFrame`, duplicate `Hello` after auth drops connection.
+- Integration (`tests/end_to_end.rs`, 12): two-client message exchange (asserts plaintext does not appear in broadcast bytes), wrong-password failure, history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, over-cap username rejected with `BadFrame`, duplicate `Hello` after auth drops connection, **rooms are isolated** (alice in alpha doesn't see bob's beta traffic), **unknown room rejected** with `AuthFailed`.
 - Pre-commit gate: `build.sh` runs `cargo fmt → cargo clippy --all-targets -- -D warnings → cargo test`.
 - Supply chain: `cargo deny check` (licenses + advisories + bans + sources).
 

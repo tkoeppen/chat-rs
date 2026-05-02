@@ -2,7 +2,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use chat_rs::crypto::noise::{
-    handshake_initiator, recv_encrypted, send_encrypted, transport_open, transport_seal,
+    build_prologue, handshake_initiator, recv_encrypted, send_encrypted, transport_open,
+    transport_seal,
 };
 use chat_rs::crypto::password::derive_keys;
 use chat_rs::crypto::room;
@@ -12,14 +13,17 @@ use chat_rs::proto::{
     RoomMessage, ServerFrame, now_ms,
 };
 use chat_rs::server;
-use chat_rs::wire::{FramedStream, frame, recv_bytes, recv_postcard, send_bytes};
+use chat_rs::server::rooms::RoomConfig;
+use chat_rs::wire::{FramedStream, frame, recv_bytes, recv_postcard, send_bytes, send_postcard};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
-fn pw(s: &[u8]) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(s.to_vec())
+fn one_room(password: &str) -> Vec<RoomConfig> {
+    vec![RoomConfig {
+        name: "main".into(),
+        password: password.into(),
+    }]
 }
 
 struct ClientCtx {
@@ -32,9 +36,15 @@ struct ClientCtx {
     welcome_history: Vec<RoomMessage>,
 }
 
-async fn connect_client(addr: SocketAddr, password: &[u8], username: &str) -> Result<ClientCtx> {
+async fn connect_client(
+    addr: SocketAddr,
+    password: &[u8],
+    username: &str,
+    room: &str,
+) -> Result<ClientCtx> {
     let sock = TcpStream::connect(addr).await?;
     let mut framed = frame(sock);
+    send_postcard(&mut framed, &ClientFrame::RoomSelect { room: room.into() }).await?;
     let salt = match recv_postcard::<_, ServerFrame>(&mut framed).await? {
         ServerFrame::Hello {
             room_salt,
@@ -43,11 +53,13 @@ async fn connect_client(addr: SocketAddr, password: &[u8], username: &str) -> Re
             assert_eq!(server_version, PROTOCOL_VERSION);
             room_salt
         }
+        ServerFrame::Error { reason } => return Err(chat_rs::error::Error::Server(reason)),
         _ => panic!("expected Hello"),
     };
     let keys = derive_keys(password, &salt)?;
     let room_key = keys.room_key;
-    let mut transport = handshake_initiator(&keys.psk, &salt, &mut framed).await?;
+    let prologue = build_prologue(room, &salt);
+    let mut transport = handshake_initiator(&keys.psk, &prologue, &mut framed).await?;
     let pt = postcard::to_stdvec(&ClientFrame::Hello {
         username: username.into(),
     })
@@ -95,13 +107,14 @@ async fn wait_ready(addr: SocketAddr) {
 #[tokio::test]
 async fn two_clients_exchange_message() {
     let addr = ephemeral_addr().await;
-    let server_handle = tokio::spawn(async move { server::run(addr, pw(b"correct horse")).await });
+    let server_handle =
+        tokio::spawn(async move { server::run(addr, one_room("correct horse")).await });
     wait_ready(addr).await;
 
-    let mut alice = connect_client(addr, b"correct horse", "alice")
+    let mut alice = connect_client(addr, b"correct horse", "alice", "main")
         .await
         .expect("alice connect");
-    let mut bob = connect_client(addr, b"correct horse", "bob")
+    let mut bob = connect_client(addr, b"correct horse", "bob", "main")
         .await
         .expect("bob connect");
 
@@ -150,10 +163,10 @@ async fn two_clients_exchange_message() {
 #[tokio::test]
 async fn wrong_password_fails_to_join() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"correct horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("correct horse")).await });
     wait_ready(addr).await;
 
-    let result = connect_client(addr, b"wrong password", "mallory").await;
+    let result = connect_client(addr, b"wrong password", "mallory", "main").await;
     assert!(result.is_err(), "wrong password must fail");
 }
 
@@ -189,17 +202,19 @@ async fn next_room_message(ctx: &mut ClientCtx) -> RoomMessage {
 #[tokio::test]
 async fn history_replays_for_late_joiner() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
-    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
+    let mut alice = connect_client(addr, b"horse", "alice", "main")
+        .await
+        .unwrap();
     for i in 0..3 {
         send_message(&mut alice, format!("msg-{i}").as_bytes()).await;
         // drain alice's own echo so the socket buffer doesn't fill up
         let _ = next_room_message(&mut alice).await;
     }
 
-    let bob = connect_client(addr, b"horse", "bob").await.unwrap();
+    let bob = connect_client(addr, b"horse", "bob", "main").await.unwrap();
     assert_eq!(
         bob.welcome_history.len(),
         3,
@@ -215,17 +230,19 @@ async fn history_replays_for_late_joiner() {
 #[tokio::test]
 async fn history_caps_at_limit_over_wire() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
-    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
+    let mut alice = connect_client(addr, b"horse", "alice", "main")
+        .await
+        .unwrap();
     let total = HISTORY_LEN + 5;
     for i in 0..total {
         send_message(&mut alice, format!("m{i}").as_bytes()).await;
         let _ = next_room_message(&mut alice).await;
     }
 
-    let bob = connect_client(addr, b"horse", "bob").await.unwrap();
+    let bob = connect_client(addr, b"horse", "bob", "main").await.unwrap();
     assert_eq!(bob.welcome_history.len(), HISTORY_LEN);
     // First in history should be the (total - HISTORY_LEN)th message.
     let first_pt = room::open(
@@ -240,11 +257,13 @@ async fn history_caps_at_limit_over_wire() {
 #[tokio::test]
 async fn clear_propagates_to_all_clients() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
-    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
-    let mut bob = connect_client(addr, b"horse", "bob").await.unwrap();
+    let mut alice = connect_client(addr, b"horse", "alice", "main")
+        .await
+        .unwrap();
+    let mut bob = connect_client(addr, b"horse", "bob", "main").await.unwrap();
 
     send_encrypted(&mut alice.framed, &mut alice.transport, &ClientFrame::Clear)
         .await
@@ -269,7 +288,7 @@ async fn clear_propagates_to_all_clients() {
 #[tokio::test]
 async fn oversized_frame_is_rejected() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
     // Open a raw socket and shove a length-prefix header that exceeds MAX_FRAME_LEN.
@@ -293,10 +312,12 @@ async fn oversized_frame_is_rejected() {
 #[tokio::test]
 async fn ad_from_mismatch_drops_connection() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
-    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
+    let mut alice = connect_client(addr, b"horse", "alice", "main")
+        .await
+        .unwrap();
 
     // Build a Message with ad.from set to someone else's UUID — this would
     // make peers' decrypts silently fail, so the server must reject loud.
@@ -324,23 +345,32 @@ async fn ad_from_mismatch_drops_connection() {
     );
 
     // Server still alive — another client can connect.
-    let _bob = connect_client(addr, b"horse", "bob").await.unwrap();
+    let _bob = connect_client(addr, b"horse", "bob", "main").await.unwrap();
 }
 
 #[tokio::test]
 async fn over_cap_username_rejected() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
     let sock = TcpStream::connect(addr).await.unwrap();
     let mut framed = frame(sock);
+    send_postcard(
+        &mut framed,
+        &ClientFrame::RoomSelect {
+            room: "main".into(),
+        },
+    )
+    .await
+    .unwrap();
     let salt = match recv_postcard::<_, ServerFrame>(&mut framed).await.unwrap() {
         ServerFrame::Hello { room_salt, .. } => room_salt,
         _ => panic!("expected Hello"),
     };
     let keys = chat_rs::crypto::password::derive_keys(b"horse", &salt).unwrap();
-    let mut transport = handshake_initiator(&keys.psk, &salt, &mut framed)
+    let prologue = build_prologue("main", &salt);
+    let mut transport = handshake_initiator(&keys.psk, &prologue, &mut framed)
         .await
         .unwrap();
 
@@ -365,10 +395,12 @@ async fn over_cap_username_rejected() {
 #[tokio::test]
 async fn duplicate_hello_after_auth_drops_connection() {
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
     wait_ready(addr).await;
 
-    let mut alice = connect_client(addr, b"horse", "alice").await.unwrap();
+    let mut alice = connect_client(addr, b"horse", "alice", "main")
+        .await
+        .unwrap();
     send_encrypted(
         &mut alice.framed,
         &mut alice.transport,
@@ -387,12 +419,75 @@ async fn duplicate_hello_after_auth_drops_connection() {
 }
 
 #[tokio::test]
-async fn unique_user_ids_per_connection() {
+async fn rooms_are_isolated() {
+    // Two rooms on the same server with different passwords. Alice in room A
+    // sends a message; Bob (in room B) must NOT receive it. Verifies per-room
+    // ConnectionManager + MessageStore isolation.
     let addr = ephemeral_addr().await;
-    let _server = tokio::spawn(async move { server::run(addr, pw(b"horse")).await });
+    let configs = vec![
+        RoomConfig {
+            name: "alpha".into(),
+            password: "passwordA".into(),
+        },
+        RoomConfig {
+            name: "beta".into(),
+            password: "passwordB".into(),
+        },
+    ];
+    let _server = tokio::spawn(async move { server::run(addr, configs).await });
     wait_ready(addr).await;
 
-    let alice = connect_client(addr, b"horse", "alice").await.unwrap();
-    let bob = connect_client(addr, b"horse", "bob").await.unwrap();
+    let mut alice = connect_client(addr, b"passwordA", "alice", "alpha")
+        .await
+        .unwrap();
+    let mut bob = connect_client(addr, b"passwordB", "bob", "beta")
+        .await
+        .unwrap();
+
+    send_message(&mut alice, b"only-for-alpha").await;
+    let _echo = next_room_message(&mut alice).await;
+
+    // Bob should NOT see anything for at least 500ms (no cross-room delivery).
+    let bob_got_anything =
+        tokio::time::timeout(Duration::from_millis(500), recv_bytes(&mut bob.framed)).await;
+    assert!(
+        bob_got_anything.is_err(),
+        "bob in room beta must not receive alpha's broadcast"
+    );
+
+    // Sanity: Bob's room is functional.
+    send_message(&mut bob, b"hello-from-beta").await;
+    let bob_echo = next_room_message(&mut bob).await;
+    let pt = room::open(&bob.room_key, &bob_echo.ciphertext, &bob_echo.ad).unwrap();
+    assert_eq!(pt, b"hello-from-beta");
+}
+
+#[tokio::test]
+async fn unknown_room_rejected() {
+    // Connecting to a room name the server doesn't know returns an Error
+    // frame (AuthFailed — not BadFrame, so an attacker can't enumerate room
+    // names). connect_client maps that to Error::Server.
+    let addr = ephemeral_addr().await;
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
+    wait_ready(addr).await;
+
+    let r = connect_client(addr, b"horse", "ghost", "no-such-room").await;
+    match r {
+        Err(chat_rs::error::Error::Server(ErrorKind::AuthFailed)) => {}
+        Err(other) => panic!("expected Server(AuthFailed), got Err({other})"),
+        Ok(_) => panic!("expected Err for unknown room"),
+    }
+}
+
+#[tokio::test]
+async fn unique_user_ids_per_connection() {
+    let addr = ephemeral_addr().await;
+    let _server = tokio::spawn(async move { server::run(addr, one_room("horse")).await });
+    wait_ready(addr).await;
+
+    let alice = connect_client(addr, b"horse", "alice", "main")
+        .await
+        .unwrap();
+    let bob = connect_client(addr, b"horse", "bob", "main").await.unwrap();
     assert_ne!(alice.user_id, bob.user_id);
 }
