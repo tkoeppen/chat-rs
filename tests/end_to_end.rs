@@ -240,19 +240,20 @@ async fn clear_propagates_to_all_clients() {
         .await
         .unwrap();
 
-    let cleared = tokio::time::timeout(Duration::from_secs(2), async {
+    let (cleared_by, cleared_username) = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let f: ServerFrame = recv_encrypted(&mut bob.framed, &mut bob.transport)
                 .await
                 .unwrap();
-            if let ServerFrame::Cleared { by } = f {
-                return by;
+            if let ServerFrame::Cleared { by, username } = f {
+                return (by, username);
             }
         }
     })
     .await
     .expect("bob got clear");
-    assert_eq!(cleared, alice.user_id);
+    assert_eq!(cleared_by, alice.user_id);
+    assert_eq!(cleared_username, "alice");
 }
 
 #[tokio::test]

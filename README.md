@@ -16,9 +16,19 @@ Early development. The wire protocol is not yet stable.
 - **Message encryption:** XChaCha20-Poly1305 with a fresh 24-byte random nonce per message; `MessageAd { from, timestamp_ms }` is bound in as AAD.
 - **No disk writes:** keys, messages, and history exist only in process memory; password material is zeroized on drop and never leaves the client.
 
+## Build
+
+```sh
+cargo build --release
+# optional — put `chat-rs` on your PATH:
+cargo install --path .
+```
+
+If you skip `cargo install`, every `chat-rs …` invocation in the snippets below can be replaced with `cargo run --release -- …`. The two are equivalent; the rest of this README uses `chat-rs` for brevity.
+
 ## Usage
 
-The password is read from the `CHAT_RS_PASSWORD` environment variable if set, otherwise from an interactive prompt. There is no `--password` flag — passwords on the command line leak into shell history.
+The password is read from the `CHAT_RS_PASSWORD` environment variable if set, otherwise from an interactive prompt. There is no `--password` flag — passwords on the command line leak into shell history and `ps`.
 
 Start a server:
 
@@ -32,40 +42,46 @@ Connect a client:
 chat-rs connect SERVER_IP 3000 username
 ```
 
-Inside the client REPL, `/clear` wipes the room history for everyone.
+Inside the client TUI, `/clear` wipes the room history for everyone (locally too), and **Ctrl-C** quits cleanly.
 
 ## Try it locally
 
 One server + two clients, each in its own terminal, talking on `127.0.0.1`. The `CHAT_RS_PASSWORD` export is used here to skip three interactive prompts; for real use, just run the commands without it and type the password when asked.
 
+> If you haven't run `cargo install --path .`, substitute `cargo run --release --` for `chat-rs` in each snippet — the rest is identical.
+
 **Terminal 1 — server:**
 
 ```sh
 export CHAT_RS_PASSWORD=hunter2
-cargo run --release -- serve 127.0.0.1 3000
+chat-rs serve 127.0.0.1 3000
 ```
 
 **Terminal 2 — alice:**
 
 ```sh
 export CHAT_RS_PASSWORD=hunter2
-cargo run --release -- connect 127.0.0.1 3000 alice
+chat-rs connect 127.0.0.1 3000 alice
 ```
 
 **Terminal 3 — bob:**
 
 ```sh
 export CHAT_RS_PASSWORD=hunter2
-cargo run --release -- connect 127.0.0.1 3000 bob
+chat-rs connect 127.0.0.1 3000 bob
 ```
 
-Each client opens a small TUI (alt-screen, raw mode): scrolling room pane on top, single-line input box at the bottom, status bar with the connect info. Type a line and hit **enter** to send — peers see it as `[hh:mm:ss] alice: <message>` with usernames colored. The last 15 messages are replayed to anyone who joins later. Send `/clear` to wipe the room history for everyone. **Ctrl-C** quits the client cleanly (the terminal is restored even on panic via an RAII guard).
+Each client opens a small TUI (alt-screen, raw mode): centered **Secure Terminal Chat** header, cyan status bar, scrolling room pane, single-line input box.
 
-## Build
+| Key | Action |
+| --- | --- |
+| Enter | Send the current line (or `/clear`) |
+| ↑ / ↓ | Scroll the room pane 1 line |
+| PgUp / PgDn | Scroll nearly a full pane |
+| Home / End | Oldest visible / back to live |
+| Ctrl-C | Quit cleanly (terminal restored via RAII guard) |
 
-```sh
-cargo build --release
-```
+Type a line in alice's window and hit **enter** — bob sees it as `[hh:mm:ss] alice: <message>` with usernames colored. The last 15 messages are replayed to anyone who joins later. Send `/clear` from either client to wipe the room history for everyone — the post-clear screen is a single `cleared by alice` notice.
 
 ## License
 

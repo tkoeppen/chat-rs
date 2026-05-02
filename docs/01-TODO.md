@@ -14,7 +14,7 @@ Reference implementations (UX/CLI parity only):
 ## Crypto stack — at-a-glance
 
 | Layer | Choice | Crate |
-|------|--------|-------|
+| --- | --- | --- |
 | Password stretching | Argon2id (m=64 MiB, t=3, p=1) | `argon2` |
 | Authenticated KEX | Noise NNpsk0 (X25519 + ChaCha20-Poly1305 + BLAKE2s) | `snow` |
 | Room AEAD | XChaCha20-Poly1305 (24-byte random nonce) | `chacha20poly1305` |
@@ -88,7 +88,7 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Password input source (stdin / env / interactive prompt) — `CHAT_RS_PASSWORD` env, falling back to interactive `rpassword` prompt; no `--password` flag
 - [ ] Replay protection inside the room — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client
 - [ ] Bind `username` into `MessageAd` so a malicious server can't relabel messages
-- [ ] Include `username` in `ServerFrame::Cleared` (currently only `by: Uuid`) so the client can render `cleared by alice` instead of `cleared by 6e3b…`. Small wire-protocol additive change; one extra field
+- [x] Include `username` in `ServerFrame::Cleared` so the client renders `cleared by alice` instead of `cleared by 6e3b…`. Wire-protocol additive change: `Cleared { by: Uuid, username: String }`. Server forwards the session's username on `ClientFrame::Clear`; integration test asserts both fields propagate
 - [ ] Decide whether room-key forward secrecy (ratchet) is in scope for 1.0 or deferred
   - **Current gap.** The Noise transport already has forward secrecy (per-connection X25519 ephemerals). The room layer does not: `room_key = BLAKE2s(Argon2id(password, room_salt), "chat-rs/v1/room")` is fixed for the life of the room. Anyone who later learns the password decrypts every recorded ciphertext.
   - **Options (cheap → strong):**

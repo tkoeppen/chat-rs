@@ -30,6 +30,7 @@ pub enum ServerFrame {
     Message(RoomMessage),
     Cleared {
         by: Uuid,
+        username: String,
     },
     Error {
         reason: ErrorKind,

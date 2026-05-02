@@ -304,7 +304,14 @@ async fn handle_client_frame(
                 let mut m = state.messages.lock().await;
                 m.clear();
             }
-            broadcast(state, ServerFrame::Cleared { by: user_id }).await;
+            broadcast(
+                state,
+                ServerFrame::Cleared {
+                    by: user_id,
+                    username: username.to_string(),
+                },
+            )
+            .await;
             Ok(())
         }
     }

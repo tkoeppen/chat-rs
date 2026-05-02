@@ -35,7 +35,7 @@ The password is read from the `CHAT_RS_PASSWORD` environment variable if set, ot
 ### Primitives
 
 | Role | Choice | Crate |
-|------|--------|-------|
+| --- | --- | --- |
 | Password stretching | Argon2id (m=64 MiB, t=3, p=1, len=32) | `argon2` |
 | Authenticated key exchange | Noise NNpsk0 — X25519 + ChaCha20-Poly1305 + BLAKE2s | `snow` |
 | Room-level AEAD | XChaCha20-Poly1305 (24-byte random nonce) | `chacha20poly1305` |
@@ -58,7 +58,7 @@ The server generates `room_salt` once at startup (32 random bytes) and reuses it
 
 Once the client has `room_salt` from the server hello:
 
-```
+```text
 master   = Argon2id(password, room_salt, m=64 MiB, t=3, p=1, len=32)
 psk      = Blake2sMac256(key=master, msg=b"chat-rs/v1/psk")     // 32 bytes
 room_key = Blake2sMac256(key=master, msg=b"chat-rs/v1/room")    // 32 bytes
@@ -72,7 +72,7 @@ The server precomputes its `psk` once at startup (in `ServerState::new`), drops 
 
 Pattern: `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`. Two messages:
 
-```
+```text
 client ─ M0 = e, psk-mix ───────────────────────► server
 client ◄─ M1 = e, ee, transport(empty payload) ── server
                                                        // both sides now in transport phase
@@ -101,7 +101,7 @@ enum ServerFrame {
     Hello   { room_salt: [u8; 32], server_version: u16 }, // sent once, plaintext, before Noise
     Welcome { user_id: Uuid, history: Vec<RoomMessage> }, // sent inside Noise transport
     Message(RoomMessage),
-    Cleared { by: Uuid },
+    Cleared { by: Uuid, username: String },
     Error   { reason: ErrorKind },
 }
 
@@ -121,7 +121,7 @@ The server **never** decrypts `ciphertext` — it only forwards it and tracks or
 
 ### Room encryption
 
-```
+```text
 nonce      = XChaCha20-Poly1305 random 24 bytes
 plaintext  = UTF-8 message body
 ad         = postcard(MessageAd { from, timestamp_ms })
@@ -149,7 +149,7 @@ The client uses an alt-screen TUI built on `crossterm` 0.29 + `ratatui` 0.30 (`c
 
 ### Layout
 
-```
+```text
 Secure Terminal Chat                           ← centered bold-magenta header
  alice · 127.0.0.1:3000  —  enter · /clear …   ← cyan status bar
 ┌ room ─────────────────────────────────────┐
@@ -166,7 +166,7 @@ When scrolled back, the room title shows `room (↑ scrolled N — End to return
 ### Keys
 
 | Key | Action |
-|-----|--------|
+| --- | --- |
 | Enter | Send message (or `/clear` command) |
 | Backspace | Delete previous char in input |
 | Char | Append to input |
@@ -185,7 +185,7 @@ When scrolled back, the room title shows `room (↑ scrolled N — End to return
 
 ## Module layout
 
-```
+```text
 src/
   main.rs               // entrypoint: clap parse → cli::run + tracing init
   lib.rs                // re-exports for integration tests
@@ -213,7 +213,7 @@ tests/
 
 See `Cargo.toml` for the canonical list; each direct dep has a one-line purpose comment. Summary:
 
-```
+```text
 Async/transport:   tokio (trimmed features), tokio-util (codec + sync),
                    futures-util (sink+std)
 CLI / I/O:         clap (derive), rpassword
@@ -258,7 +258,6 @@ Tracked in detail in [`01-TODO.md`](01-TODO.md) Phase 5. Headlines:
 
 - **Replay protection inside the room** — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client.
 - **Bind `username` into `MessageAd`** — close the relabeling gap (`from` Uuid is bound; display name is not).
-- **Include `username` in `ServerFrame::Cleared`** — UX nicety; render `cleared by alice` not `cleared by 6e3b…`.
 - **Forward secrecy on the room key** — currently fixed for the room's lifetime. Tentative direction: server-driven salt rotation (Phase 5 has the full options table and reasoning).
 - **Protocol-version negotiation** — server advertises; client doesn't. Add a `ClientFrame::Hello` field if server-side gating ever matters.
 - **Rate-limit failed Noise handshakes** — per source IP. Defense-in-depth now that the per-connect Argon2 cost is gone.

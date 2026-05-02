@@ -140,12 +140,12 @@ fn handle_server_frame(
             state.push(ui::decrypt_to_display(room_key, &m));
             None
         }
-        ServerFrame::Cleared { by } => {
+        ServerFrame::Cleared { by: _, username } => {
             // Wipe local display too, so /clear actually empties the room
             // for every client (sender included). The notice survives so
             // the user sees feedback that the clear happened.
             state.clear_messages();
-            state.push_system(format!("cleared by {by}"));
+            state.push_system(format!("cleared by {username}"));
             None
         }
         ServerFrame::Error { reason } => Some(Error::Server(reason)),
