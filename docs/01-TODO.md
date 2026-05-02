@@ -65,12 +65,17 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 
 - [x] Stale-session cleanup task (3600 s timeout, 300 s sweep interval)
 - [x] Graceful shutdown (Ctrl-C drains, zeroizes keys, closes sockets). Server uses `tokio_util::sync::CancellationToken` + `JoinSet`: ctrl-c cancels the token, the accept loop and per-connection `pump` arms exit, and the listener drops while the JoinSet drains all in-flight tasks. `Arc<ServerState>` refcount then hits zero and the cached `psk` zeroizes via `Zeroizing`. Client selects on `tokio::signal::ctrl_c()` in its main loop and returns; the room key wipes on drop.
-- [x] `tracing` + `tracing-subscriber` with `RUST_LOG`/`EnvFilter` (default `chat_rs=info,warn`); discipline-only field scrub via module-level doc comments listing forbidden field names — no structured logger filter yet
+- [x] `tracing` + `tracing-subscriber` with `RUST_LOG`/`EnvFilter` (default `chat_rs=info,warn`); structured-filter field scrub now landed (see the `FieldScrub` Filter entry below)
 - [x] Cache Noise psk in `ServerState::new` and drop the password before listening — closes the per-connect 64 MiB Argon2 DoS
 - [x] Reject `ClientFrame::Message` with `ad.from != session user_id` — prevents AAD-mismatch DoS where peers' decrypts silently fail
 - [x] Cap `Hello.username` at `MAX_USERNAME_LEN = 32`
 - [x] Broadcast uses `try_send` + evict on `Full`/`Closed` — slow peer can no longer head-of-line block delivery
-- [ ] Rate-limit failed Noise handshakes per source IP — defense-in-depth; per-connect Argon2 cost is no longer the issue (psk is cached)
+- [x] Rate-limit failed Noise handshakes per source IP. `RateLimiter` (sliding window, default 60 connects / 60 s, sweeper-pruned) checked in the accept loop; over-limit sockets are dropped without spawning a task. 3 unit tests
+- [x] Handshake read timeouts (5 s) on Noise M0/M1 + first encrypted Hello. Closes the slow-loris vector (idle TCP connects holding tokio tasks + FDs forever)
+- [x] Salt bound into Noise prologue. MITM tampering with the plaintext server-hello fails on M0 instead of after the client wastes Argon2. Unit test `prologue_mismatch_fails`
+- [x] Minimum password length: 8 chars enforced in `cli::read_password` (env + prompt paths). `Error::Protocol("password too short")` if violated
+- [x] Disable core dumps via `setrlimit(RLIMIT_CORE, 0)` at startup (Unix). A crash can't write key material to disk
+- [x] Logger field-scrub enforcement (was discipline-only). `FieldScrub` `Filter` layer drops events whose metadata declares `password`, `psk`, `room_key`, `master`, `nonce`, `tag`, or `auth_tag`
 - [x] Integration test: two clients exchange a message; assert plaintext does not leak into broadcast bytes
 - [x] Integration test: wrong password fails to join
 - [x] Integration test: history replay for late joiner (3 messages + capped at 15)
@@ -91,8 +96,8 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 ## Phase 5 — Open questions to resolve before 1.0
 
 - [x] Password input source (stdin / env / interactive prompt) — `CHAT_RS_PASSWORD` env, falling back to interactive `rpassword` prompt; no `--password` flag
-- [ ] Replay protection inside the room — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client
-- [ ] Bind `username` into `MessageAd` so a malicious server can't relabel messages
+- [x] Replay protection inside the room — per-sender monotonic `counter` field added to `MessageAd`. Server tracks `last_counter` per session and rejects non-increasing values; clients track per-sender (`Uuid`-keyed) `seen_counters` and drop replays the server might inject
+- [x] Bind `username` into `MessageAd` so a malicious server can't relabel messages. Server enforces `ad.username == session username` on receive
 - [x] Include `username` in `ServerFrame::Cleared` so the client renders `cleared by alice` instead of `cleared by 6e3b…`. Wire-protocol additive change: `Cleared { by: Uuid, username: String }`. Server forwards the session's username on `ClientFrame::Clear`; integration test asserts both fields propagate
 - [ ] Decide whether room-key forward secrecy (ratchet) is in scope for 1.0 or deferred
   - **Current gap.** The Noise transport already has forward secrecy (per-connection X25519 ephemerals). The room layer does not: `room_key = BLAKE2s(Argon2id(password, room_salt), "chat-rs/v1/room")` is fixed for the life of the room. Anyone who later learns the password decrypts every recorded ciphertext.

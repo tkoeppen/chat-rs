@@ -5,7 +5,7 @@
 //! Ctrl-C is captured as a key event (raw mode swallows the SIGINT) and
 //! triggers a clean exit via `KeyAction::Quit`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Stdout, stdout};
 use std::net::SocketAddr;
 
@@ -42,6 +42,12 @@ pub struct UiState {
     /// Inner height of the room pane (excluding borders) as of the last
     /// render. Used by paging keys; updated by `render`.
     pub last_inner_h: usize,
+    /// Next per-session counter we'll assign to an outgoing message. Bound
+    /// into `MessageAd.counter` so peers (and the server) can reject replays.
+    pub next_counter: u64,
+    /// Highest counter we've accepted from each sender (keyed by `user_id`,
+    /// which is fresh per session — collisions across sessions don't happen).
+    pub seen_counters: HashMap<Uuid, u64>,
 }
 
 pub struct DisplayMsg {
@@ -70,6 +76,20 @@ impl UiState {
             messages: VecDeque::with_capacity(HISTORY_CAP),
             scroll: 0,
             last_inner_h: 0,
+            next_counter: 1,
+            seen_counters: HashMap::new(),
+        }
+    }
+
+    /// Returns true and updates the seen value if `counter` strictly exceeds
+    /// the last accepted counter from `sender`; false otherwise (replay).
+    pub fn try_accept_counter(&mut self, sender: Uuid, counter: u64) -> bool {
+        let entry = self.seen_counters.entry(sender).or_insert(0);
+        if counter > *entry {
+            *entry = counter;
+            true
+        } else {
+            false
         }
     }
 
@@ -284,8 +304,12 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
                 "/q" | "/quit" => return KeyAction::Quit,
                 _ => {}
             }
+            let counter = state.next_counter;
+            state.next_counter = state.next_counter.saturating_add(1);
             let ad = MessageAd {
                 from: state.user_id,
+                username: state.username.clone(),
+                counter,
                 timestamp_ms: now_ms(),
             };
             match room::seal(room_key, trimmed.as_bytes(), &ad) {

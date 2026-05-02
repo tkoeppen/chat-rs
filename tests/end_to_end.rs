@@ -25,6 +25,8 @@ fn pw(s: &[u8]) -> Zeroizing<Vec<u8>> {
 struct ClientCtx {
     room_key: [u8; 32],
     user_id: Uuid,
+    username: String,
+    next_counter: u64,
     transport: snow::TransportState,
     framed: FramedStream<TcpStream>,
     welcome_history: Vec<RoomMessage>,
@@ -45,7 +47,7 @@ async fn connect_client(addr: SocketAddr, password: &[u8], username: &str) -> Re
     };
     let keys = derive_keys(password, &salt)?;
     let room_key = keys.room_key;
-    let mut transport = handshake_initiator(&keys.psk, &mut framed).await?;
+    let mut transport = handshake_initiator(&keys.psk, &salt, &mut framed).await?;
     let pt = postcard::to_stdvec(&ClientFrame::Hello {
         username: username.into(),
     })
@@ -62,6 +64,8 @@ async fn connect_client(addr: SocketAddr, password: &[u8], username: &str) -> Re
     Ok(ClientCtx {
         room_key,
         user_id,
+        username: username.to_string(),
+        next_counter: 1,
         transport,
         framed,
         welcome_history,
@@ -104,8 +108,11 @@ async fn two_clients_exchange_message() {
     let plaintext = b"hello bob";
     let ad = MessageAd {
         from: alice.user_id,
+        username: alice.username.clone(),
+        counter: alice.next_counter,
         timestamp_ms: now_ms(),
     };
+    alice.next_counter += 1;
     let ct = room::seal(&alice.room_key, plaintext, &ad).unwrap();
     let pt = postcard::to_stdvec(&ClientFrame::Message {
         ad: ad.clone(),
@@ -153,8 +160,11 @@ async fn wrong_password_fails_to_join() {
 async fn send_message(ctx: &mut ClientCtx, body: &[u8]) {
     let ad = MessageAd {
         from: ctx.user_id,
+        username: ctx.username.clone(),
+        counter: ctx.next_counter,
         timestamp_ms: now_ms(),
     };
+    ctx.next_counter += 1;
     let ct = room::seal(&ctx.room_key, body, &ad).unwrap();
     send_encrypted(
         &mut ctx.framed,
@@ -293,8 +303,11 @@ async fn ad_from_mismatch_drops_connection() {
     let bogus = Uuid::new_v4();
     let ad = MessageAd {
         from: bogus,
+        username: alice.username.clone(),
+        counter: alice.next_counter,
         timestamp_ms: now_ms(),
     };
+    alice.next_counter += 1;
     let ct = room::seal(&alice.room_key, b"spoof", &ad).unwrap();
     send_encrypted(
         &mut alice.framed,
@@ -327,7 +340,9 @@ async fn over_cap_username_rejected() {
         _ => panic!("expected Hello"),
     };
     let keys = chat_rs::crypto::password::derive_keys(b"horse", &salt).unwrap();
-    let mut transport = handshake_initiator(&keys.psk, &mut framed).await.unwrap();
+    let mut transport = handshake_initiator(&keys.psk, &salt, &mut framed)
+        .await
+        .unwrap();
 
     // 33 chars = MAX_USERNAME_LEN + 1
     let big = "a".repeat(MAX_USERNAME_LEN + 1);

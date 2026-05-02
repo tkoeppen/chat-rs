@@ -4,6 +4,7 @@
 //! Plaintext message bodies are also forbidden in logs.
 
 pub mod managers;
+pub mod ratelimit;
 pub mod stores;
 
 use std::net::SocketAddr;
@@ -28,11 +29,21 @@ use crate::proto::{ClientFrame, MAX_USERNAME_LEN, PROTOCOL_VERSION, RoomMessage,
 use crate::wire::{FramedStream, frame, send_postcard};
 
 use managers::ConnectionManager;
+use ratelimit::RateLimiter;
 use stores::{MessageStore, UserSessionStore};
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(3600);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const OUTBOX_DEPTH: usize = 64;
+/// Time budget for the unauthenticated handshake phase (Noise M0/M1 + the
+/// first encrypted ClientFrame::Hello). Connections that don't complete in
+/// this window are dropped — closes the slow-loris vector against tasks/FDs.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-IP connection cap inside `RATELIMIT_WINDOW`. Generous enough that a
+/// typical user with many tabs/sessions isn't blocked, low enough that a
+/// scripted flood from a single source is.
+const RATELIMIT_MAX: usize = 60;
+const RATELIMIT_WINDOW: Duration = Duration::from_secs(60);
 
 pub struct ServerState {
     pub room_salt: [u8; 32],
@@ -42,6 +53,7 @@ pub struct ServerState {
     pub messages: Mutex<MessageStore>,
     pub sessions: Mutex<UserSessionStore>,
     pub connections: Mutex<ConnectionManager>,
+    pub ratelimit: RateLimiter,
 }
 
 impl ServerState {
@@ -57,6 +69,7 @@ impl ServerState {
             messages: Mutex::new(MessageStore::new()),
             sessions: Mutex::new(UserSessionStore::new(SESSION_TIMEOUT)),
             connections: Mutex::new(ConnectionManager::new()),
+            ratelimit: RateLimiter::new(RATELIMIT_MAX, RATELIMIT_WINDOW),
         }))
     }
 }
@@ -84,6 +97,11 @@ pub async fn run(addr: SocketAddr, password: Zeroizing<Vec<u8>>) -> Result<()> {
             res = listener.accept() => {
                 match res {
                     Ok((sock, peer)) => {
+                        if !state.ratelimit.check(peer.ip()) {
+                            warn!(%peer, "rate-limited; dropping connection");
+                            drop(sock);
+                            continue;
+                        }
                         let state = state.clone();
                         let shutdown = shutdown.clone();
                         tasks.spawn(async move {
@@ -117,6 +135,9 @@ async fn sweeper(state: Arc<ServerState>, shutdown: CancellationToken) {
             let s = state.sessions.lock().await;
             s.stale()
         };
+        // Always sweep the rate-limiter so a churn of distinct IPs doesn't
+        // grow its HashMap unbounded.
+        state.ratelimit.cleanup();
         if stale.is_empty() {
             continue;
         }
@@ -150,17 +171,40 @@ async fn handle_connection(
     )
     .await?;
 
-    // Phase 1: Noise NNpsk0 handshake using the pre-derived psk.
-    let mut transport = match handshake_responder(&state.psk, &mut framed).await {
-        Ok(t) => t,
-        Err(e) => {
+    // Phase 1: Noise NNpsk0 handshake using the pre-derived psk. The salt is
+    // bound into the Noise prologue so MITM tampering with the plaintext
+    // server-hello fails immediately on M0 instead of after Argon2 work.
+    // Wrapped in a timeout to close the slow-loris vector.
+    let mut transport = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_responder(&state.psk, &state.room_salt, &mut framed),
+    )
+    .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             warn!(%peer, error = %e, "handshake failed");
             return Err(e);
+        }
+        Err(_) => {
+            warn!(%peer, "handshake timed out");
+            return Err(Error::Protocol("handshake timeout"));
         }
     };
 
     // First Noise-encrypted frame from client must be ClientFrame::Hello.
-    let first: ClientFrame = recv_encrypted(&mut framed, &mut transport).await?;
+    let first: ClientFrame = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        recv_encrypted(&mut framed, &mut transport),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => {
+            warn!(%peer, "client did not send Hello in time");
+            return Err(Error::Protocol("hello timeout"));
+        }
+    };
     let username = match first {
         ClientFrame::Hello { username } => {
             if username.is_empty() || username.len() > MAX_USERNAME_LEN {
@@ -281,10 +325,20 @@ async fn handle_client_frame(
     match msg {
         ClientFrame::Hello { .. } => Err(Error::Protocol("duplicate Hello")),
         ClientFrame::Message { ad, ciphertext } => {
-            // Reject mismatched `ad.from` so a misbehaving client can't make
-            // peers' decrypts mysteriously fail (the AAD wouldn't match).
+            // Validate the bound metadata. ad.from / ad.username are checked
+            // here, and ad.counter must strictly increase (replay protection).
+            // All three failures are protocol violations → drop the connection.
             if ad.from != user_id {
                 return Err(Error::Protocol("ad.from does not match session user_id"));
+            }
+            if ad.username != username {
+                return Err(Error::Protocol("ad.username does not match session"));
+            }
+            {
+                let mut sessions = state.sessions.lock().await;
+                if !sessions.try_advance_counter(user_id, ad.counter) {
+                    return Err(Error::Protocol("ad.counter not strictly increasing"));
+                }
             }
             let room_msg = RoomMessage {
                 from: user_id,

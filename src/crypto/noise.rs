@@ -12,22 +12,33 @@ fn params() -> NoiseParams {
     PATTERN.parse().expect("static noise pattern")
 }
 
-pub fn initiator(psk: &[u8; 32]) -> Result<HandshakeState> {
-    Ok(Builder::new(params()).psk(0, psk)?.build_initiator()?)
+pub fn initiator(psk: &[u8; 32], prologue: &[u8]) -> Result<HandshakeState> {
+    Ok(Builder::new(params())
+        .prologue(prologue)?
+        .psk(0, psk)?
+        .build_initiator()?)
 }
 
-pub fn responder(psk: &[u8; 32]) -> Result<HandshakeState> {
-    Ok(Builder::new(params()).psk(0, psk)?.build_responder()?)
+pub fn responder(psk: &[u8; 32], prologue: &[u8]) -> Result<HandshakeState> {
+    Ok(Builder::new(params())
+        .prologue(prologue)?
+        .psk(0, psk)?
+        .build_responder()?)
 }
 
+/// `prologue` is mixed into the handshake hash on both sides so any in-flight
+/// tampering with the plaintext server-hello (room_salt, server_version) fails
+/// fast on the first transport message instead of after the client wastes its
+/// Argon2 budget. Both sides MUST pass identical prologue bytes.
 pub async fn handshake_initiator<S>(
     psk: &[u8; 32],
+    prologue: &[u8],
     framed: &mut FramedStream<S>,
 ) -> Result<TransportState>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut hs = initiator(psk)?;
+    let mut hs = initiator(psk, prologue)?;
     let mut buf = vec![0u8; NOISE_BUF];
 
     let n = hs.write_message(&[], &mut buf)?;
@@ -41,12 +52,13 @@ where
 
 pub async fn handshake_responder<S>(
     psk: &[u8; 32],
+    prologue: &[u8],
     framed: &mut FramedStream<S>,
 ) -> Result<TransportState>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut hs = responder(psk)?;
+    let mut hs = responder(psk, prologue)?;
     let mut buf = vec![0u8; NOISE_BUF];
 
     let m0 = recv_bytes(framed).await?;
@@ -105,6 +117,8 @@ mod tests {
     use crate::wire::frame;
     use tokio::io::duplex;
 
+    const PROLOGUE: &[u8] = b"test";
+
     #[tokio::test]
     async fn handshake_round_trip() {
         let psk = [7u8; 32];
@@ -113,10 +127,12 @@ mod tests {
         let mut client_framed = frame(b);
 
         let server = tokio::spawn(async move {
-            let t = handshake_responder(&[7u8; 32], &mut server_framed).await?;
+            let t = handshake_responder(&[7u8; 32], PROLOGUE, &mut server_framed).await?;
             Ok::<_, crate::error::Error>(t)
         });
-        let mut client_t = handshake_initiator(&psk, &mut client_framed).await.unwrap();
+        let mut client_t = handshake_initiator(&psk, PROLOGUE, &mut client_framed)
+            .await
+            .unwrap();
         let mut server_t = server.await.unwrap().unwrap();
 
         let ct = transport_seal(&mut client_t, b"hi").unwrap();
@@ -130,9 +146,27 @@ mod tests {
         let mut server_framed = frame(a);
         let mut client_framed = frame(b);
 
-        let server =
-            tokio::spawn(async move { handshake_responder(&[1u8; 32], &mut server_framed).await });
-        let client = handshake_initiator(&[2u8; 32], &mut client_framed).await;
+        let server = tokio::spawn(async move {
+            handshake_responder(&[1u8; 32], PROLOGUE, &mut server_framed).await
+        });
+        let client = handshake_initiator(&[2u8; 32], PROLOGUE, &mut client_framed).await;
+        let server = server.await.unwrap();
+        assert!(client.is_err() || server.is_err());
+    }
+
+    #[tokio::test]
+    async fn prologue_mismatch_fails() {
+        // Both sides have the right PSK but disagree on the prologue (i.e.,
+        // an active MITM tampered with the plaintext server-hello). Handshake
+        // must fail.
+        let (a, b) = duplex(8192);
+        let mut server_framed = frame(a);
+        let mut client_framed = frame(b);
+
+        let server = tokio::spawn(async move {
+            handshake_responder(&[7u8; 32], b"server-prologue", &mut server_framed).await
+        });
+        let client = handshake_initiator(&[7u8; 32], b"client-prologue", &mut client_framed).await;
         let server = server.await.unwrap();
         assert!(client.is_err() || server.is_err());
     }

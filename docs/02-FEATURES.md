@@ -114,17 +114,24 @@ struct RoomMessage {
     ciphertext: Vec<u8>,      // 24-byte nonce ‖ ct ‖ tag
 }
 
-struct MessageAd { from: Uuid, timestamp_ms: u64 }
+struct MessageAd { from: Uuid, username: String, counter: u64, timestamp_ms: u64 }
 ```
 
-The server **never** decrypts `ciphertext` — it only forwards it and tracks ordering / history. Sender identity (`from`) and timestamp are bound to the ciphertext via AEAD additional data, so a malicious server cannot relabel `from` without breaking decryption. The server enforces `ad.from == session user_id` on receive: misbehaving clients are rejected with `Protocol`, not silently overwritten.
+The server **never** decrypts `ciphertext` — it only forwards it and tracks ordering / history. The AEAD AAD binds:
+
+- `from`: sender's UUID. Server enforces `ad.from == session user_id` on receive.
+- `username`: sender's display name. Server enforces `ad.username == session username` so a malicious server can't relabel messages without breaking decryption everywhere.
+- `counter`: per-sender monotonic. Server tracks `last_counter` per session and rejects non-increasing values; clients also track per-`(user_id)` to reject any replay the server might inject.
+- `timestamp_ms`: client wall-clock at send. Bound to detect tamper but not authoritatively validated.
+
+All three of (from / username / counter) failing → `Protocol` error → connection dropped.
 
 ### Room encryption
 
 ```text
 nonce      = XChaCha20-Poly1305 random 24 bytes
 plaintext  = UTF-8 message body
-ad         = postcard(MessageAd { from, timestamp_ms })
+ad         = postcard(MessageAd { from, username, counter, timestamp_ms })
 ciphertext = XChaCha20Poly1305::seal(room_key, nonce, plaintext, ad)
 ```
 
@@ -150,8 +157,8 @@ The client uses an alt-screen TUI built on `crossterm` 0.29 + `ratatui` 0.30 (`c
 ### Layout
 
 ```text
-Secure Terminal Chat                           ← centered bold-magenta header
- alice · 127.0.0.1:3000  —  enter · /clear …   ← cyan status bar
+Secure Terminal Chat                              ← centered bold-magenta header
+ alice · 127.0.0.1:3000  —  enter · /(c)lear …   ← cyan status bar
 ┌ room ─────────────────────────────────────┐
 │ [12:34:56] alice: hello                   │
 │ [12:34:58] bob: hi                        │  ← scrolling pane, per-username color
@@ -202,13 +209,14 @@ src/
     noise.rs            // snow Noise NNpsk0 handshake + transport helpers
   server/
     mod.rs              // listener, handle_connection, pump, broadcast, sweeper, shutdown
-    stores.rs           // MessageStore (ring buffer), UserSessionStore (idle eviction)
+    stores.rs           // MessageStore (ring buffer), UserSessionStore (idle eviction + per-session counter)
     managers.rs         // ConnectionManager (mpsc::Sender map per session)
+    ratelimit.rs        // per-source-IP sliding-window connection cap
   client/
     mod.rs              // connect, handshake, event_loop orchestration
     ui.rs               // ratatui TUI: UiState, render, handle_key, TerminalGuard
 tests/
-  end_to_end.rs         // 7 integration tests (handshake, history, /clear, oversized, …)
+  end_to_end.rs         // 10 integration tests (handshake, history, /clear, oversized, ad.from, username cap, dup Hello, …)
 ```
 
 ## Dependencies
@@ -223,7 +231,8 @@ Wire / serde:      serde (derive), postcard (use-std, default-features=false)
 Crypto:            snow, argon2, chacha20poly1305, blake2, zeroize, getrandom
 Errors:            thiserror
 Identifiers:       uuid (v4 + serde)
-Logging:           tracing, tracing-subscriber (env-filter + fmt + ansi)
+Logging:           tracing, tracing-subscriber (env-filter + fmt + ansi + registry)
+Unix-only:         libc (for setrlimit on RLIMIT_CORE at startup)
 TUI:               crossterm (event-stream), ratatui (default-features=false,
                    crossterm_0_29 + layout-cache + underline-color)
 Dev:               none
@@ -241,25 +250,37 @@ The Python references skip these; chat-rs enforces them:
 - **Bounded reads** via `LengthDelimitedCodec` with `max_frame_length(64 * 1024)`. No unbounded `read_to_end` paths.
 - **Constant-time** comparisons handled inside `chacha20poly1305`, `blake2`, and `argon2`; no direct `==` on tags or proofs in our code.
 - **No `unwrap` / `expect`** on any path reachable from network input. The single `expect` in non-test code is `crypto/noise.rs::params()` parsing the static Noise pattern string — to be folded into a `LazyLock` (see TODO Phase 4).
-- **Logger scrub** is *discipline-only* today: module-level doc comments in `server/mod.rs` and `client/mod.rs` list forbidden field names (`password`, `psk`, `room_key`, AEAD nonces/tags). A structured-logger filter would make this enforceable.
-- **Argon2 cost on the server is paid once at startup**, not per connect — `ServerState` caches the derived `psk` and drops the password before listening. Closes the otherwise-trivial 64 MiB-per-connect DoS.
-- **Per-message AEAD AAD** binds `(from, timestamp_ms)` so a malicious server can't relabel sender or rewind timestamps. The server additionally rejects `ClientFrame::Message` with `ad.from != session user_id` to fail loud rather than make peers' decrypts silently fail.
+- **Logger scrub is enforced**: a `FieldScrub` `tracing_subscriber::Filter` in `main.rs` drops any event whose metadata declares a field named `password`, `psk`, `room_key`, `master`, `nonce`, `tag`, or `auth_tag`. A misplaced `info!(?password, …)` becomes a silent no-op rather than a leak.
+- **Argon2 cost on the server is paid once at startup**, not per connect — `ServerState` caches the derived `psk` and drops the password before listening.
+- **Handshake timeout (5 s)** on the unauthenticated phase (Noise M0/M1 + first encrypted Hello). Closes the slow-loris vector against tasks/FDs.
+- **Per-source-IP rate limit (60 connects / 60 s)** sliding window. Drops the socket without spawning a task. Sweeper periodically prunes the IP table.
+- **Salt bound into Noise prologue.** MITM tampering with the plaintext server-hello fails on M0 instead of after Argon2 work.
+- **Minimum password length: 8 chars** enforced in `cli::read_password` (env and prompt paths).
+- **Core dumps disabled** at startup via `setrlimit(RLIMIT_CORE, 0)` (Unix). A crash can't write key material to disk.
+- **Per-message AEAD AAD** binds `(from, username, counter, timestamp_ms)` so a malicious server can't relabel sender, change usernames, or replay messages without breaking decryption. Server enforces all three; clients enforce counter monotonicity client-side.
 
 ## Testing
 
-- Unit (in-tree): `crypto/password.rs` (4), `crypto/room.rs` (4), `crypto/noise.rs` (2), `server/stores.rs` (1) — round-trip seal/open, wrong-password rejects, AD tampering rejects, truncated ciphertext rejects, wrong-PSK handshake fails, history ring-buffer cap.
-- Integration (`tests/end_to_end.rs`): two-client message exchange (asserts plaintext does not appear in broadcast bytes), wrong-password failure, history replay for late joiner, history cap over wire, `/clear` propagation, oversized-frame rejection without OOM, unique `user_id` per connection.
+**24 unit + 10 integration = 34 tests.**
+
+- Unit (in-tree):
+  - `crypto/password.rs` (4) — KDF determinism, password sensitivity, salt sensitivity, label separation.
+  - `crypto/room.rs` (4) — round-trip seal/open, wrong key, AD tampering, truncated ciphertext.
+  - `crypto/noise.rs` (3) — handshake round-trip, wrong PSK fails, prologue mismatch fails.
+  - `server/stores.rs` (1) — history ring-buffer cap.
+  - `server/ratelimit.rs` (3) — below-limit allowed, distinct IPs independent, cleanup drops empty.
+  - `proto.rs` (2) — postcard round-trip for every variant of `ClientFrame` and `ServerFrame`.
+  - `client/ui.rs` (7) — pinned-push keeps scroll 0, scrolled-push anchors view, `clear_messages` resets scroll, `HISTORY_CAP` evicts oldest, scroll clamps to max, `/q`+`/quit` exit, `/c`+`/clear` send Clear.
+- Integration (`tests/end_to_end.rs`, 10): two-client message exchange (asserts plaintext does not appear in broadcast bytes), wrong-password failure, history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, over-cap username rejected with `BadFrame`, duplicate `Hello` after auth drops connection.
 - Pre-commit gate: `build.sh` runs `cargo fmt → cargo clippy --all-targets -- -D warnings → cargo test`.
 - Supply chain: `cargo deny check` (licenses + advisories + bans + sources).
 
-Outstanding test gaps tracked in TODO Phase 4: sweeper-driven idle eviction, slow-peer broadcast (HOL), `ad.from` rejection, over-cap username rejection, duplicate `Hello` rejection.
+Outstanding test gaps (TODO Phase 4): sweeper-driven idle eviction, slow-peer broadcast (HOL), graceful-shutdown drain — all three need small refactors to expose injection hooks.
 
 ## Open questions
 
 Tracked in detail in [`01-TODO.md`](01-TODO.md) Phase 5. Headlines:
 
-- **Replay protection inside the room** — per-sender monotonic counter in `MessageAd`, or sliding-window cache on the client.
-- **Bind `username` into `MessageAd`** — close the relabeling gap (`from` Uuid is bound; display name is not).
 - **Forward secrecy on the room key** — currently fixed for the room's lifetime. Tentative direction: server-driven salt rotation (Phase 5 has the full options table and reasoning).
 - **Protocol-version negotiation** — server advertises; client doesn't. Add a `ClientFrame::Hello` field if server-side gating ever matters.
-- **Rate-limit failed Noise handshakes** — per source IP. Defense-in-depth now that the per-connect Argon2 cost is gone.
+- **Sender-keys ratchet** — beyond v0; would give post-compromise security at significant complexity cost.

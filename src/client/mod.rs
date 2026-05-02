@@ -40,7 +40,9 @@ pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>
 
     let keys = derive_keys(&password, &room_salt)?;
     drop(password);
-    let mut transport = handshake_initiator(&keys.psk, &mut framed).await?;
+    // Salt is bound into the Noise prologue: MITM tampering with the plaintext
+    // server-hello fails on M0 instead of after the handshake completes.
+    let mut transport = handshake_initiator(&keys.psk, &room_salt, &mut framed).await?;
     let room_key = Zeroizing::new(keys.room_key);
     drop(keys);
 
@@ -62,6 +64,9 @@ pub async fn run(addr: SocketAddr, username: String, password: Zeroizing<Vec<u8>
 
     let mut state = UiState::new(username, user_id, addr);
     for m in &history {
+        // Seed seen_counters from the replayed history so the next live
+        // message from each sender must strictly exceed what we saw here.
+        state.try_accept_counter(m.ad.from, m.ad.counter);
         state.push(ui::decrypt_to_display(&room_key, m));
     }
 
@@ -137,6 +142,13 @@ fn handle_server_frame(
 ) -> Option<Error> {
     match msg {
         ServerFrame::Message(m) => {
+            // Reject server-side replay: counter must strictly exceed the
+            // last we accepted from this sender (keyed by user_id, which is
+            // unique per session).
+            if !state.try_accept_counter(m.ad.from, m.ad.counter) {
+                state.push_system(format!("dropped replay from {}", m.username));
+                return None;
+            }
             state.push(ui::decrypt_to_display(room_key, &m));
             None
         }

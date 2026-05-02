@@ -48,6 +48,13 @@ pub struct RoomMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageAd {
     pub from: Uuid,
+    /// Display name of the sender. Bound into the AEAD AAD so a malicious
+    /// server cannot relabel messages without breaking decryption.
+    pub username: String,
+    /// Per-sender monotonic counter. Bound into the AEAD AAD; used by both
+    /// server and clients to reject replays. Starts at 1 for the first
+    /// message a client sends in its session.
+    pub counter: u64,
     pub timestamp_ms: u64,
 }
 
@@ -77,6 +84,8 @@ mod tests {
         roundtrips(&ClientFrame::Message {
             ad: MessageAd {
                 from: Uuid::nil(),
+                username: "alice".into(),
+                counter: 1,
                 timestamp_ms: 1234,
             },
             ciphertext: vec![1, 2, 3, 4],
@@ -91,6 +100,8 @@ mod tests {
             username: "alice".into(),
             ad: MessageAd {
                 from: Uuid::nil(),
+                username: "alice".into(),
+                counter: 1,
                 timestamp_ms: 1234,
             },
             ciphertext: vec![5, 6, 7],

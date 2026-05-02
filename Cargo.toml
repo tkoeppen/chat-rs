@@ -75,8 +75,15 @@ ratatui = { version = "0.30", default-features = false, features = [
 # Structured logging macros (`info!` / `debug!` / `warn!`) used across server and client.
 tracing = "0.1"
 # Subscriber wiring `RUST_LOG` env-filter to a stderr fmt layer with ANSI colors.
+# `registry` is needed to compose the env-filter with our `FieldScrub` filter
+# layer (drops events whose metadata contains forbidden field names).
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
   "ansi",
+  "registry",
 ] }
+# Used only to call `setrlimit(RLIMIT_CORE, 0)` at startup so a crash can't
+# write core dumps containing key material. Already a transitive dep via tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

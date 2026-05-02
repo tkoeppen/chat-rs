@@ -45,6 +45,8 @@ mod tests {
     fn ad() -> MessageAd {
         MessageAd {
             from: Uuid::nil(),
+            username: "alice".into(),
+            counter: 1,
             timestamp_ms: 1000,
         }
     }

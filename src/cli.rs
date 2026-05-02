@@ -36,18 +36,25 @@ pub enum Command {
 }
 
 const PASSWORD_ENV: &str = "CHAT_RS_PASSWORD";
+const MIN_PW_LEN: usize = 8;
 
 fn read_password(role: &str) -> Result<Zeroizing<Vec<u8>>> {
-    if let Ok(env) = std::env::var(PASSWORD_ENV)
+    let raw: Zeroizing<Vec<u8>> = if let Ok(env) = std::env::var(PASSWORD_ENV)
         && !env.is_empty()
     {
         let z = Zeroizing::new(env);
-        return Ok(Zeroizing::new(z.as_bytes().to_vec()));
+        Zeroizing::new(z.as_bytes().to_vec())
+    } else {
+        let prompt = format!("{role} password (min {MIN_PW_LEN} chars): ");
+        // Read into a Zeroizing<String> so the original buffer is wiped on drop.
+        let pw =
+            Zeroizing::new(rpassword::prompt_password(prompt).map_err(crate::error::Error::Io)?);
+        Zeroizing::new(pw.as_bytes().to_vec())
+    };
+    if raw.len() < MIN_PW_LEN {
+        return Err(crate::error::Error::Protocol("password too short"));
     }
-    let prompt = format!("{role} password: ");
-    // Read into a Zeroizing<String> so the original buffer is wiped on drop.
-    let pw = Zeroizing::new(rpassword::prompt_password(prompt).map_err(crate::error::Error::Io)?);
-    Ok(Zeroizing::new(pw.as_bytes().to_vec()))
+    Ok(raw)
 }
 
 pub async fn run(cli: Cli) -> Result<()> {

@@ -42,6 +42,9 @@ pub struct UserSession {
     pub user_id: Uuid,
     pub username: String,
     pub last_active: Instant,
+    /// Highest accepted `MessageAd.counter` for this session. New messages
+    /// must strictly exceed this to be accepted (replay protection).
+    pub last_counter: u64,
 }
 
 pub struct UserSessionStore {
@@ -64,6 +67,7 @@ impl UserSessionStore {
                 user_id,
                 username,
                 last_active: Instant::now(),
+                last_counter: 0,
             },
         );
     }
@@ -71,6 +75,18 @@ impl UserSessionStore {
     pub fn touch(&mut self, user_id: Uuid) {
         if let Some(s) = self.sessions.get_mut(&user_id) {
             s.last_active = Instant::now();
+        }
+    }
+
+    /// If `counter` is strictly greater than the session's `last_counter`,
+    /// updates and returns true; otherwise leaves it and returns false.
+    pub fn try_advance_counter(&mut self, user_id: Uuid, counter: u64) -> bool {
+        match self.sessions.get_mut(&user_id) {
+            Some(s) if counter > s.last_counter => {
+                s.last_counter = counter;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -99,6 +115,8 @@ mod tests {
             username: "x".into(),
             ad: MessageAd {
                 from: Uuid::nil(),
+                username: "x".into(),
+                counter: 1,
                 timestamp_ms: 0,
             },
             ciphertext: text.as_bytes().to_vec(),

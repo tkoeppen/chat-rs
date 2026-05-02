@@ -276,6 +276,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "getrandom 0.4.2",
+ "libc",
  "postcard",
  "ratatui",
  "rpassword",
