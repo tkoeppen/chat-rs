@@ -50,9 +50,8 @@ const RATELIMIT_MAX: usize = 60;
 const RATELIMIT_WINDOW: Duration = Duration::from_secs(60);
 /// Hard ceiling on concurrent in-flight connections (handshaking + active).
 /// Bounds FD + per-conn outbox memory under a /64-IPv6 or botnet flood that
-/// the per-IP rate limit can't fully contain. Sized for ~16 GiB worst-case
-/// outbox (4096 × OUTBOX_DEPTH × MAX_FRAME_LEN), safely below typical FD
-/// soft limits.
+/// the per-IP rate limit can't fully contain. Picked as a sensible default
+/// for a single host; tune per deployment if needed.
 const MAX_ACTIVE_CONNS: usize = 4096;
 
 pub type RoomId = String;
@@ -251,9 +250,8 @@ async fn handle_connection(
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
 
-    // Cap concurrent connections (M-3). Increment via RAII so every
-    // early-return path decrements correctly. Drop the socket immediately
-    // when over cap — no Hello, no slot held.
+    // Cap concurrent connections via RAII so every early-return path
+    // decrements. Over cap: drop the socket immediately, no slot held.
     let Some(_conn_guard) = ConnGuard::try_acquire(hub.clone(), MAX_ACTIVE_CONNS) else {
         warn!(%peer, "active-connection cap reached; dropping");
         drop(sock);
@@ -289,13 +287,13 @@ async fn handle_connection(
         .await;
         return Err(Error::Protocol("invalid room name length"));
     }
-    // Unknown-room path (M-1): synthesize a junk RoomState with random salt +
-    // random PSK and proceed exactly as for a real room. The handshake will
-    // fail at M1 verify on the client side — same wire shape as wrong-password
-    // against a real room, so an external observer cannot enumerate names.
-    // Treat the fake room exactly like a real one all the way through; any
-    // early-out would create a timing oracle (fake-room closes faster than
-    // wrong-password-against-real-room, which waits for the client EOF).
+    // Unknown room: synthesize a junk RoomState with random salt + random
+    // PSK and proceed exactly as for a real room. Handshake will fail at M1
+    // verify on the client side — same wire shape as wrong-password against
+    // a real room, so an observer can't enumerate room names. Don't early-
+    // out on the fake path: that would re-introduce a timing oracle (fake
+    // closes faster than real-room+wrong-password, which waits for client
+    // EOF after its M1 fails).
     let room = match hub.rooms.get(&room_name).cloned() {
         Some(r) => r,
         None => {
@@ -478,9 +476,9 @@ async fn handle_client_frame(
             if ad.username != username {
                 return Err(Error::Protocol("ad.username does not match session"));
             }
-            // L-3: bound per-message ciphertext so a busy room with large
+            // Bound per-message ciphertext so a busy room with large
             // messages can't push the next joiner's `Welcome` past
-            // MAX_FRAME_LEN. Includes the 24-byte nonce + 16-byte tag.
+            // `MAX_FRAME_LEN` (Welcome carries up to HISTORY_LEN of these).
             if ciphertext.len() > MAX_CIPHERTEXT_LEN {
                 return Err(Error::Protocol("ciphertext exceeds MAX_CIPHERTEXT_LEN"));
             }
@@ -489,7 +487,6 @@ async fn handle_client_frame(
                 if !sessions.try_advance_counter(user_id, ad.counter) {
                     return Err(Error::Protocol("ad.counter not strictly increasing"));
                 }
-                // M-4: per-session message-rate cap.
                 if !sessions.try_consume_message_quota(user_id) {
                     return Err(Error::Protocol("message rate exceeded"));
                 }
@@ -508,7 +505,6 @@ async fn handle_client_frame(
             Ok(())
         }
         ClientFrame::Clear => {
-            // L-2: cooldown on `/clear` (destructive + broadcast-amplified).
             {
                 let mut sessions = room.sessions.lock().await;
                 if !sessions.try_consume_clear(user_id) {
@@ -532,9 +528,8 @@ async fn handle_client_frame(
     }
 }
 
-/// L-1: ASCII-only `[A-Za-z0-9_-]` for usernames. Same charset as room
-/// names. Blocks bidi-override / zero-width / control-char spoofing in the
-/// TUI without needing a full Unicode confusables table.
+/// ASCII `[A-Za-z0-9_-]` only. Blocks bidi-override / zero-width /
+/// control-char spoofing in the TUI; matches the room-name charset.
 fn is_valid_username(name: &str) -> bool {
     name.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')

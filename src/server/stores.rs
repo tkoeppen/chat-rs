@@ -7,12 +7,14 @@ use crate::proto::{HISTORY_LEN, RoomMessage};
 
 /// Per-session message-send cap, sliding-window. Authenticated DoS guard:
 /// without this, one client at line rate triggers O(N) broadcast work per
-/// message across every other peer in the room.
+/// message across every other peer in the room. Default tuned for human
+/// typing (3 msg/s sustained is well above any non-script user); operators
+/// running busier rooms should raise it.
 pub const MSG_RATE_MAX: usize = 30;
 pub const MSG_RATE_WINDOW: Duration = Duration::from_secs(10);
 /// Minimum gap between `/clear` operations from a single session. `/clear`
-/// is destructive and broadcast-amplified, so a short cooldown stops
-/// griefing without breaking legitimate use.
+/// is destructive and broadcast-amplified; 30 s is short enough to not
+/// annoy legitimate use, long enough to break a flood loop.
 pub const CLEAR_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub struct MessageStore {

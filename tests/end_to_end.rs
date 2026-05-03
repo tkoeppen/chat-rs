@@ -472,7 +472,7 @@ async fn rooms_are_isolated() {
 
 #[tokio::test]
 async fn unknown_room_indistinguishable_from_wrong_password() {
-    // M-1: the server synthesizes a fake (random salt, random PSK) hello on
+    // The server synthesizes a fake (random salt, random PSK) hello on
     // unknown rooms. The client receives a valid Hello, derives keys, and
     // the handshake fails at M1 verify — same wire shape as wrong-password
     // against a real room. Either path surfaces as a Noise/AEAD-style error,
@@ -512,7 +512,7 @@ async fn unique_user_ids_per_connection() {
     assert_ne!(alice.user_id, bob.user_id);
 }
 
-/// L-1: usernames with non-`[A-Za-z0-9_-]` chars are rejected at Hello time.
+/// Usernames with non-`[A-Za-z0-9_-]` chars are rejected at Hello time.
 /// Picks a username with a bidi RTL override — innocuous on the wire,
 /// dangerous in a TUI render. Must surface as `BadFrame`.
 #[tokio::test]
@@ -530,8 +530,8 @@ async fn invalid_username_charset_rejected() {
     }
 }
 
-/// L-3: a `Message` whose ciphertext exceeds `MAX_CIPHERTEXT_LEN` is dropped
-/// by the server (connection closes). Without this cap, the next joiner's
+/// A `Message` whose ciphertext exceeds `MAX_CIPHERTEXT_LEN` is dropped by
+/// the server (connection closes). Without this cap, the next joiner's
 /// `Welcome` could exceed `MAX_FRAME_LEN`.
 #[tokio::test]
 async fn oversized_ciphertext_rejected() {
@@ -570,8 +570,8 @@ async fn oversized_ciphertext_rejected() {
     );
 }
 
-/// M-4: per-session message-rate cap. Sends `MSG_RATE_MAX + 1` messages back
-/// to back; the last one must close the connection.
+/// Per-session message-rate cap. Sends `MSG_RATE_MAX + 1` messages back to
+/// back; the last one must close the connection.
 #[tokio::test]
 async fn message_rate_cap_enforced() {
     use chat_rs::server::stores::MSG_RATE_MAX;
@@ -685,8 +685,8 @@ async fn ad_username_mismatch_drops_connection() {
     );
 }
 
-/// L-2: per-session `/clear` cooldown. Two `/clear` frames in a row from
-/// the same session: the second must close the connection.
+/// Per-session `/clear` cooldown. Two `/clear` frames in a row from the
+/// same session: the second must close the connection.
 #[tokio::test]
 async fn clear_cooldown_enforced() {
     let addr = ephemeral_addr().await;

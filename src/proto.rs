@@ -57,13 +57,12 @@ pub enum ServerFrame {
     },
 }
 
-/// Server-broadcast message frame. `from` and `username` are the *session*
-/// values the server enforced (and so the receiver can trust them for
-/// display). `ad.from` and `ad.username` carry the same fields a second
-/// time, but bound into the AEAD AAD — so the receiver also verifies them
-/// implicitly when `room::open` succeeds. The duplication is deliberate:
-/// outer fields are convenient (no need to inspect AAD to render), inner
-/// fields are authenticated.
+/// Server-broadcast message frame. The outer `from` / `username` and the
+/// inner `ad.from` / `ad.username` carry the same values: the server sets
+/// the outer fields to the session-validated identity, and `ad` is bound
+/// into the AEAD AAD so the receiver re-verifies the inner copies on
+/// decrypt. The duplication is redundant — only the AAD-bound fields are
+/// actually authenticated — and could be flattened in a future wire-break.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomMessage {
     pub from: Uuid,
