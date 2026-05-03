@@ -1,5 +1,8 @@
 # chat-rs
 
+[![CI](https://github.com/tkoeppen/chat-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/tkoeppen/chat-rs/actions/workflows/ci.yml)
+[![Security](https://github.com/tkoeppen/chat-rs/actions/workflows/security.yml/badge.svg)](https://github.com/tkoeppen/chat-rs/actions/workflows/security.yml)
+
 Encrypted terminal chat in Rust. No persistence, no logs — keys live in RAM only.
 
 A Rust port of [cmd-chat](https://github.com/diorwave/cmd-chat) (Python). One binary acts as both server and client; messages are end-to-end encrypted and the server only ever sees ciphertext.
