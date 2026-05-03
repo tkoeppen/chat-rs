@@ -6,7 +6,11 @@ All notable changes to this project are documented here. Format follows
 **minor bumps may be wire-breaking** — protocol changes are called out
 explicitly.
 
-## [Unreleased] — 0.2.0
+## [Unreleased]
+
+_Nothing yet._
+
+## [0.2.0] — 2026-05-03
 
 ### Added
 
@@ -25,9 +29,6 @@ explicitly.
   `proto.rs` for cross-module reuse.
 - 500 ms tick in the client event loop drives auto-expiry + countdown
   refresh.
-- 3 new tests: `ephemeral_message_broadcasts_but_not_in_history` (e2e),
-  `tick_expire_drops_aged_ephemerals_only`, `reveal_then_remask_after_window`,
-  `ephemeral_countdown_rounds_up` (unit).
 
 ### Changed (BREAKING)
 
@@ -35,8 +36,6 @@ explicitly.
   `ephemeral`. Postcard is positional — old/new builds cannot interoperate.
   The Noise prologue binds version, so the handshake fails fast on
   mismatched peers.
-
----
 
 ## [0.1.0] — 2026-05-03
 
@@ -107,5 +106,5 @@ First public release.
   documented exception is a static infallible Noise-pattern parse, narrowly
   `#[allow]`-ed.
 
-[Unreleased]: https://github.com/tkoeppen/chat-rs/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/tkoeppen/chat-rs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/tkoeppen/chat-rs/releases/tag/v0.1.0
