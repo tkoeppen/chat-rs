@@ -121,7 +121,7 @@ struct RoomMessage {
     ciphertext: Vec<u8>,      // 24-byte nonce ‖ ct ‖ tag
 }
 
-struct MessageAd { from: Uuid, username: String, counter: u64, timestamp_ms: u64 }
+struct MessageAd { from: Uuid, username: String, counter: u64, timestamp_ms: u64, ephemeral: bool }
 ```
 
 The server **never** decrypts `ciphertext` — it only forwards it and tracks ordering / history. The AEAD AAD binds:
@@ -130,6 +130,7 @@ The server **never** decrypts `ciphertext` — it only forwards it and tracks or
 - `username`: sender's display name. Server enforces `ad.username == session username` so a malicious server can't relabel messages without breaking decryption everywhere.
 - `counter`: per-sender monotonic. Server tracks `last_counter` per session and rejects non-increasing values; clients also track per-`(user_id)` to reject any replay the server might inject.
 - `timestamp_ms`: client wall-clock at send. Bound to detect tamper but not authoritatively validated.
+- `ephemeral`: set by `/secret` / `/s`. AAD-bound so the server can read it (skips join-replay history) without being able to flip it. Receivers render the body as `EPHEMERAL_MASK = "*******"`, auto-delete after `EPHEMERAL_TTL_MS = 30_000`, and Ctrl-R reveals briefly (`EPHEMERAL_REVEAL_MS = 3_000`).
 
 All three of (from / username / counter) failing → `Protocol` error → connection dropped.
 
@@ -275,7 +276,7 @@ The Python references skip these; chat-rs enforces them:
 
 ## Testing
 
-**30 unit + 17 integration = 47 tests.**
+**32 unit + 18 integration = 50 tests.**
 
 - Unit (in-tree):
   - `crypto/password.rs` (4) — KDF determinism, password sensitivity, salt sensitivity, label separation.
@@ -285,8 +286,8 @@ The Python references skip these; chat-rs enforces them:
   - `server/ratelimit.rs` (3) — below-limit allowed, distinct IPs independent, cleanup drops empty.
   - `server/rooms.rs` (5) — parses two rooms with comments, rejects short password, rejects invalid name, rejects duplicate room, rejects empty config.
   - `proto.rs` (2) — postcard round-trip for every variant of `ClientFrame` and `ServerFrame`.
-  - `client/ui.rs` (8) — pinned-push keeps scroll 0, scrolled-push anchors view, `clear_messages` resets scroll, `HISTORY_CAP` evicts oldest, scroll clamps to max, `/q`+`/quit` exit, `/c`+`/clear` send Clear, `try_accept_counter` rejects per-sender replay.
-- Integration (`tests/end_to_end.rs`, 17): two-client message exchange (asserts plaintext does not appear in broadcast bytes), history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, **`ad.username` mismatch drops connection** (server-side relabel defense), **server rejects counter replay** (per-session monotonicity), over-cap username rejected with `BadFrame`, **invalid-charset username rejected** (bidi-override `\u{202E}`), duplicate `Hello` after auth drops connection, **rooms are isolated** (alice in alpha doesn't see bob's beta traffic), **unknown room indistinguishable from wrong password** (M-1 fake-hello — also covers wrong-password rejection), **oversized ciphertext rejected** (L-3), **message-rate cap enforced** (M-4), **`/clear` cooldown enforced** (L-2).
+  - `client/ui.rs` (10) — pinned-push keeps scroll 0, scrolled-push anchors view, `clear_messages` resets scroll, `HISTORY_CAP` evicts oldest, scroll clamps to max, `/q`+`/quit` exit, `/c`+`/clear` send Clear, `try_accept_counter` rejects per-sender replay, `tick_expire` drops aged ephemerals only, `reveal_ephemerals` flips back off after the window.
+- Integration (`tests/end_to_end.rs`, 18): two-client message exchange (asserts plaintext does not appear in broadcast bytes), history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, **`ad.username` mismatch drops connection** (server-side relabel defense), **server rejects counter replay** (per-session monotonicity), over-cap username rejected with `BadFrame`, **invalid-charset username rejected** (bidi-override `\u{202E}`), duplicate `Hello` after auth drops connection, **rooms are isolated** (alice in alpha doesn't see bob's beta traffic), **unknown room indistinguishable from wrong password** (M-1 fake-hello — also covers wrong-password rejection), **oversized ciphertext rejected** (L-3), **message-rate cap enforced** (M-4), **`/clear` cooldown enforced** (L-2), **ephemeral message broadcasts but not into history** (server skips join-replay store on `ad.ephemeral`).
 - Pre-commit gate: `build.sh` runs `cargo fmt → cargo clippy --all-targets -- -D warnings → cargo test`.
 - Supply chain: `cargo deny check` (licenses + advisories + bans + sources).
 

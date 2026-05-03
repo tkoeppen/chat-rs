@@ -497,7 +497,10 @@ async fn handle_client_frame(
                 ad,
                 ciphertext,
             };
-            {
+            // Ephemeral messages are broadcast but never enter the join-replay
+            // history — late joiners must not see them. Auto-expiry on each
+            // peer's TUI handles the rest.
+            if !room_msg.ad.ephemeral {
                 let mut m = room.messages.lock().await;
                 m.push(room_msg.clone());
             }

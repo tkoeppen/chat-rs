@@ -127,6 +127,7 @@ async fn two_clients_exchange_message() {
         username: alice.username.clone(),
         counter: alice.next_counter,
         timestamp_ms: now_ms(),
+        ephemeral: false,
     };
     alice.next_counter += 1;
     let ct = room::seal(&alice.room_key, plaintext, &ad).unwrap();
@@ -169,6 +170,8 @@ async fn send_message(ctx: &mut ClientCtx, body: &[u8]) {
         username: ctx.username.clone(),
         counter: ctx.next_counter,
         timestamp_ms: now_ms(),
+
+        ephemeral: false,
     };
     ctx.next_counter += 1;
     let ct = room::seal(&ctx.room_key, body, &ad).unwrap();
@@ -331,6 +334,8 @@ async fn ad_from_mismatch_drops_connection() {
         username: alice.username.clone(),
         counter: alice.next_counter,
         timestamp_ms: now_ms(),
+
+        ephemeral: false,
     };
     alice.next_counter += 1;
     let ct = room::seal(&alice.room_key, b"spoof", &ad).unwrap();
@@ -552,6 +557,8 @@ async fn oversized_ciphertext_rejected() {
         username: alice.username.clone(),
         counter: alice.next_counter,
         timestamp_ms: now_ms(),
+
+        ephemeral: false,
     };
     alice.next_counter += 1;
     let ciphertext = vec![0u8; MAX_CIPHERTEXT_LEN + 1];
@@ -621,6 +628,8 @@ async fn server_rejects_counter_replay() {
             username: alice.username.clone(),
             counter: 5,
             timestamp_ms: now_ms(),
+
+            ephemeral: false,
         };
         let ct = room::seal(&alice.room_key, b"replayed", &ad).unwrap();
         send_encrypted(
@@ -667,6 +676,8 @@ async fn ad_username_mismatch_drops_connection() {
         username: "mallory".into(), // session is "alice" — server must reject
         counter: alice.next_counter,
         timestamp_ms: now_ms(),
+
+        ephemeral: false,
     };
     alice.next_counter += 1;
     let ct = room::seal(&alice.room_key, b"spoof", &ad).unwrap();
@@ -716,5 +727,59 @@ async fn clear_cooldown_enforced() {
     assert!(
         r.is_ok(),
         "server should close on second /clear within cooldown"
+    );
+}
+
+/// Ephemeral message: alice sends with `ad.ephemeral = true`. Bob (already
+/// connected) receives it via broadcast. A late-joining carol sees an empty
+/// history — the server skipped the join-replay store. Auto-expiry is a UI
+/// concern (covered by unit tests in `client/ui.rs`).
+#[tokio::test]
+async fn ephemeral_message_broadcasts_but_not_in_history() {
+    let addr = ephemeral_addr().await;
+    let _server =
+        tokio::spawn(async move { server::run(addr, one_room("horse-staple-correct")).await });
+    wait_ready(addr).await;
+
+    let mut alice = connect_client(addr, b"horse-staple-correct", "alice", "main")
+        .await
+        .unwrap();
+    let mut bob = connect_client(addr, b"horse-staple-correct", "bob", "main")
+        .await
+        .unwrap();
+
+    let plaintext = b"meet me at the docks";
+    let ad = MessageAd {
+        from: alice.user_id,
+        username: alice.username.clone(),
+        counter: alice.next_counter,
+        timestamp_ms: now_ms(),
+        ephemeral: true,
+    };
+    alice.next_counter += 1;
+    let ct = room::seal(&alice.room_key, plaintext, &ad).unwrap();
+    send_encrypted(
+        &mut alice.framed,
+        &mut alice.transport,
+        &ClientFrame::Message { ad, ciphertext: ct },
+    )
+    .await
+    .unwrap();
+
+    // Bob, already in the room, gets the broadcast normally.
+    let received = tokio::time::timeout(Duration::from_secs(2), next_room_message(&mut bob))
+        .await
+        .expect("bob got message");
+    assert!(received.ad.ephemeral, "ephemeral flag must survive AAD");
+    let pt = room::open(&bob.room_key, &received.ciphertext, &received.ad).unwrap();
+    assert_eq!(pt, plaintext);
+
+    // Carol joins after the message — must NOT see it in welcome history.
+    let carol = connect_client(addr, b"horse-staple-correct", "carol", "main")
+        .await
+        .unwrap();
+    assert!(
+        carol.welcome_history.is_empty(),
+        "ephemeral messages must not enter join-replay history"
     );
 }

@@ -3,7 +3,11 @@ use uuid::Uuid;
 
 use crate::error::ErrorKind;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Bumped from 1 → 2: `MessageAd` gained the `ephemeral` flag. Postcard is a
+/// positional binary format, so adding a field is wire-incompatible. Old
+/// builds and new builds cannot interoperate; the prologue binds version
+/// so the handshake fails fast on mismatch.
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
 pub const HISTORY_LEN: usize = 15;
 /// Bound on `ClientFrame::Hello { username }`. Keeps a misbehaving client from
@@ -82,7 +86,21 @@ pub struct MessageAd {
     /// message a client sends in its session.
     pub counter: u64,
     pub timestamp_ms: u64,
+    /// Sender requested this message is *ephemeral*: rendered as a fixed
+    /// mask in receivers' TUIs (Ctrl-R reveals briefly), auto-deleted from
+    /// every client's view after `EPHEMERAL_TTL`, and excluded from the
+    /// server's join-replay history. Bound into the AEAD AAD so the server
+    /// can act on it (skip history) without being able to flip it.
+    pub ephemeral: bool,
 }
+
+/// How long ephemeral messages stay visible in any TUI before auto-delete.
+pub const EPHEMERAL_TTL_MS: u64 = 30_000;
+/// How long Ctrl-R reveals masked ephemeral messages before re-masking.
+pub const EPHEMERAL_REVEAL_MS: u64 = 3_000;
+/// Fixed-width mask for ephemeral messages. Constant length so the masked
+/// rendering doesn't leak the original message length.
+pub const EPHEMERAL_MASK: &str = "*******";
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -117,6 +135,7 @@ mod tests {
                 username: "alice".into(),
                 counter: 1,
                 timestamp_ms: 1234,
+                ephemeral: false,
             },
             ciphertext: vec![1, 2, 3, 4],
         });
@@ -133,6 +152,7 @@ mod tests {
                 username: "alice".into(),
                 counter: 1,
                 timestamp_ms: 1234,
+                ephemeral: false,
             },
             ciphertext: vec![5, 6, 7],
         };

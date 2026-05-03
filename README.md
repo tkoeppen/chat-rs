@@ -91,11 +91,13 @@ Each client opens a small TUI (alt-screen, raw mode): centered **Secure Terminal
 | PgUp / PgDn | Scroll nearly a full pane |
 | Home / End | Oldest visible / back to live |
 | Ctrl-C | Quit cleanly (terminal restored via RAII guard) |
+| Ctrl-R | Briefly reveal masked ephemeral messages (3 s) |
 
 | Slash command | Action |
 | --- | --- |
 | `/clear` or `/c` | Wipe room history for everyone (locally too) |
 | `/quit` or `/q` | Exit cleanly (same as Ctrl-C) |
+| `/secret <msg>` or `/s <msg>` | Send an ephemeral message: shown as `*******` on every client, never enters the join-replay history, auto-deleted after 30 s. Press **Ctrl-R** to briefly reveal currently-masked messages (3 s). |
 
 Type a line in alice's window and hit **enter** — bob sees it as `[hh:mm:ss] alice: <message>` with usernames colored. The last 15 messages are replayed to anyone who joins later. Send `/clear` from either client to wipe the room history for everyone — the post-clear screen is a single `cleared by alice` notice.
 

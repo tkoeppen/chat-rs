@@ -6,6 +6,7 @@
 pub mod ui;
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
@@ -108,6 +109,10 @@ async fn event_loop<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // 500 ms tick drives ephemeral-message expiry + reveal-window cleanup
+    // and forces a re-render so a masked message disappearing isn't held
+    // back by the keypress/network select arms.
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
         guard
             .term()
@@ -141,6 +146,9 @@ where
                 if let Some(err) = handle_server_frame(state, room_key, msg) {
                     return Err(err);
                 }
+            }
+            _ = tick.tick() => {
+                state.tick_expire_ephemerals();
             }
         }
     }

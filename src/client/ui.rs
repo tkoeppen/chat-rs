@@ -8,6 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Stdout, stdout};
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use crossterm::execute;
 use crossterm::terminal::{
@@ -23,7 +24,10 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use uuid::Uuid;
 
 use crate::crypto::room;
-use crate::proto::{ClientFrame, MessageAd, RoomMessage, now_ms};
+use crate::proto::{
+    ClientFrame, EPHEMERAL_MASK, EPHEMERAL_REVEAL_MS, EPHEMERAL_TTL_MS, MessageAd, RoomMessage,
+    now_ms,
+};
 
 const HISTORY_CAP: usize = 500;
 
@@ -54,6 +58,16 @@ pub struct UiState {
 pub struct DisplayMsg {
     pub ts_ms: u64,
     pub kind: DisplayKind,
+    /// Some(...) iff this is an ephemeral message (`/secret` or `/s`). Drives
+    /// masking, Ctrl-R reveal, and `EPHEMERAL_TTL_MS` auto-expiry.
+    pub ephemeral: Option<EphemeralState>,
+}
+
+pub struct EphemeralState {
+    /// When the message arrived locally — drives the auto-expire deadline.
+    pub received_at: Instant,
+    /// `Some(t)` while currently revealed; cleared when `t` passes.
+    pub revealed_until: Option<Instant>,
 }
 
 pub enum DisplayKind {
@@ -114,12 +128,51 @@ impl UiState {
         self.push(DisplayMsg {
             ts_ms: now_ms(),
             kind: DisplayKind::System { text: text.into() },
+            ephemeral: None,
         });
     }
 
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.scroll = 0;
+    }
+
+    /// Drop ephemeral messages whose `received_at + EPHEMERAL_TTL_MS` has
+    /// passed, and clear the reveal flag on any whose reveal window expired.
+    /// Called from the event-loop tick.
+    pub fn tick_expire_ephemerals(&mut self) {
+        let now = Instant::now();
+        let ttl = Duration::from_millis(EPHEMERAL_TTL_MS);
+        let before = self.messages.len();
+        self.messages.retain(|m| match &m.ephemeral {
+            Some(e) => now.duration_since(e.received_at) < ttl,
+            None => true,
+        });
+        // If we dropped messages while the user was scrolled back, keep the
+        // historical anchor consistent with the smaller deque.
+        if self.messages.len() < before {
+            self.clamp_scroll();
+        }
+        // Re-mask any revealed messages whose reveal window expired.
+        for m in &mut self.messages {
+            if let Some(e) = &mut m.ephemeral
+                && let Some(until) = e.revealed_until
+                && now >= until
+            {
+                e.revealed_until = None;
+            }
+        }
+    }
+
+    /// Briefly reveal every currently-masked ephemeral message for the next
+    /// `EPHEMERAL_REVEAL_MS`. Triggered by Ctrl-R.
+    pub fn reveal_ephemerals(&mut self) {
+        let until = Instant::now() + Duration::from_millis(EPHEMERAL_REVEAL_MS);
+        for m in &mut self.messages {
+            if let Some(e) = &mut m.ephemeral {
+                e.revealed_until = Some(until);
+            }
+        }
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -197,7 +250,7 @@ pub fn render(f: &mut ratatui::Frame, state: &mut UiState) {
     f.render_widget(header, chunks[0]);
 
     let status = Paragraph::new(format!(
-        " {} · #{} · {}  —  enter to send · /(c)lear · /(q)uit · ↑↓/PgUp/PgDn scroll · End live",
+        " {} · #{} · {}  —  enter · /(c)lear · /(q)uit · /(s)ecret <msg> · ^R reveal",
         state.username, state.room, state.addr,
     ))
     .style(Style::default().fg(Color::Black).bg(Color::Cyan));
@@ -238,16 +291,44 @@ pub fn render(f: &mut ratatui::Frame, state: &mut UiState) {
 fn format_line(m: &DisplayMsg) -> Line<'_> {
     let ts = fmt_ts(m.ts_ms);
     match &m.kind {
-        DisplayKind::Message { username, text } => Line::from(vec![
-            Span::styled(format!("[{ts}] "), Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{username}: "),
-                Style::default()
-                    .fg(color_for(username))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(text.as_str()),
-        ]),
+        DisplayKind::Message { username, text } => {
+            // Ephemeral + currently masked → render the fixed-length mask.
+            // Revealed (Ctrl-R within the reveal window) → cleartext in italic
+            // so the user knows it's transient.
+            let now = Instant::now();
+            let body = match &m.ephemeral {
+                Some(e) if e.revealed_until.is_none_or(|t| now >= t) => {
+                    Span::styled(EPHEMERAL_MASK, Style::default().fg(Color::DarkGray))
+                }
+                Some(_) => Span::styled(
+                    text.as_str(),
+                    Style::default()
+                        .fg(Color::LightYellow)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+                None => Span::raw(text.as_str()),
+            };
+            // For ephemerals, append a `(Ns)` countdown to the username — gives
+            // the reader a "how long do I have left to Ctrl-R" cue. The 500 ms
+            // tick refreshes this between renders.
+            let header = match &m.ephemeral {
+                Some(e) => {
+                    let secs_left = ephemeral_secs_left(e.received_at, now);
+                    format!("{username} ({secs_left}): ")
+                }
+                None => format!("{username}: "),
+            };
+            Line::from(vec![
+                Span::styled(format!("[{ts}] "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    header,
+                    Style::default()
+                        .fg(color_for(username))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                body,
+            ])
+        }
         DisplayKind::System { text } => Line::from(vec![
             Span::styled(format!("[{ts}] "), Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -258,6 +339,13 @@ fn format_line(m: &DisplayMsg) -> Line<'_> {
             ),
         ]),
     }
+}
+
+/// Whole seconds left before an ephemeral message hits its TTL. Saturates
+/// at 0 so a tick that runs slightly after expiry never shows a negative.
+fn ephemeral_secs_left(received_at: Instant, now: Instant) -> u64 {
+    let elapsed_ms = now.duration_since(received_at).as_millis() as u64;
+    EPHEMERAL_TTL_MS.saturating_sub(elapsed_ms).div_ceil(1000)
 }
 
 fn fmt_ts(ms: u64) -> String {
@@ -294,6 +382,11 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return KeyAction::Quit;
     }
+    // Ctrl-R: briefly reveal every currently-masked ephemeral message.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
+        state.reveal_ephemerals();
+        return KeyAction::None;
+    }
     match key.code {
         KeyCode::Enter => {
             let line = std::mem::take(&mut state.input);
@@ -306,6 +399,20 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
                 "/q" | "/quit" => return KeyAction::Quit,
                 _ => {}
             }
+            // /s <text> or /secret <text> → ephemeral message. Empty body
+            // (just "/s" with nothing after) is a no-op.
+            let (body, ephemeral) = if let Some(rest) = trimmed
+                .strip_prefix("/s ")
+                .or(trimmed.strip_prefix("/secret "))
+            {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    return KeyAction::None;
+                }
+                (rest.to_string(), true)
+            } else {
+                (trimmed.to_string(), false)
+            };
             let counter = state.next_counter;
             state.next_counter = state.next_counter.saturating_add(1);
             let ad = MessageAd {
@@ -313,8 +420,9 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
                 username: state.username.clone(),
                 counter,
                 timestamp_ms: now_ms(),
+                ephemeral,
             };
-            match room::seal(room_key, trimmed.as_bytes(), &ad) {
+            match room::seal(room_key, body.as_bytes(), &ad) {
                 Ok(ct) => KeyAction::Send(ClientFrame::Message { ad, ciphertext: ct }),
                 Err(_) => {
                     state.push_system("encryption failed");
@@ -361,6 +469,10 @@ pub fn handle_key(state: &mut UiState, key: KeyEvent, room_key: &[u8; 32]) -> Ke
 }
 
 pub fn decrypt_to_display(room_key: &[u8; 32], m: &RoomMessage) -> DisplayMsg {
+    let ephemeral = m.ad.ephemeral.then(|| EphemeralState {
+        received_at: Instant::now(),
+        revealed_until: None,
+    });
     match room::open(room_key, &m.ciphertext, &m.ad) {
         Ok(pt) => DisplayMsg {
             ts_ms: m.ad.timestamp_ms,
@@ -368,12 +480,14 @@ pub fn decrypt_to_display(room_key: &[u8; 32], m: &RoomMessage) -> DisplayMsg {
                 username: m.username.clone(),
                 text: String::from_utf8_lossy(&pt).into_owned(),
             },
+            ephemeral,
         },
         Err(_) => DisplayMsg {
             ts_ms: m.ad.timestamp_ms,
             kind: DisplayKind::System {
                 text: format!("[decryption failed] {}", m.username),
             },
+            ephemeral: None,
         },
     }
 }
@@ -396,6 +510,7 @@ mod tests {
         DisplayMsg {
             ts_ms: 0,
             kind: DisplayKind::System { text: text.into() },
+            ephemeral: None,
         }
     }
 
@@ -506,5 +621,92 @@ mod tests {
         assert!(s.try_accept_counter(alice, 3), "monotone advance allowed");
         // Independent per sender — bob's counter is its own state.
         assert!(s.try_accept_counter(bob, 1));
+    }
+
+    fn ephemeral_msg(received_at: Instant) -> DisplayMsg {
+        DisplayMsg {
+            ts_ms: 0,
+            kind: DisplayKind::Message {
+                username: "alice".into(),
+                text: "secret".into(),
+            },
+            ephemeral: Some(EphemeralState {
+                received_at,
+                revealed_until: None,
+            }),
+        }
+    }
+
+    /// `tick_expire_ephemerals` drops expired ephemeral messages and leaves
+    /// non-ephemeral ones alone. Uses an artificially-aged `received_at` so
+    /// the test doesn't have to actually sleep `EPHEMERAL_TTL_MS`.
+    #[test]
+    fn tick_expire_drops_aged_ephemerals_only() {
+        let mut s = state();
+        let aged = Instant::now() - Duration::from_millis(EPHEMERAL_TTL_MS + 100);
+        let fresh = Instant::now();
+        s.push(ephemeral_msg(aged));
+        s.push(ephemeral_msg(fresh));
+        s.push(sys("regular system msg"));
+        s.tick_expire_ephemerals();
+        assert_eq!(
+            s.messages.len(),
+            2,
+            "aged ephemeral dropped; fresh + system kept"
+        );
+    }
+
+    /// `ephemeral_secs_left` rounds up so the on-screen counter shows
+    /// `(30) → (29) → … → (1)` over the message's lifetime, never `(0)`
+    /// while the message still exists.
+    #[test]
+    fn ephemeral_countdown_rounds_up() {
+        let now = Instant::now();
+        // Just-arrived: full TTL.
+        assert_eq!(ephemeral_secs_left(now, now), EPHEMERAL_TTL_MS / 1000);
+        // 1 ms in: still 30 (ceil leaves the second intact until elapsed crosses 1 s).
+        let one_ms_later = now + Duration::from_millis(1);
+        assert_eq!(
+            ephemeral_secs_left(now, one_ms_later),
+            EPHEMERAL_TTL_MS / 1000
+        );
+        // Exactly 1 s in: counter ticks down by one.
+        let one_s_later = now + Duration::from_secs(1);
+        assert_eq!(
+            ephemeral_secs_left(now, one_s_later),
+            EPHEMERAL_TTL_MS / 1000 - 1
+        );
+        // 1 ms before TTL: still showing 1.
+        let almost_done = now + Duration::from_millis(EPHEMERAL_TTL_MS - 1);
+        assert_eq!(ephemeral_secs_left(now, almost_done), 1);
+        // Past TTL: saturates to 0 (tick_expire would have dropped the message
+        // by the time the renderer sees this state).
+        let after_ttl = now + Duration::from_millis(EPHEMERAL_TTL_MS + 500);
+        assert_eq!(ephemeral_secs_left(now, after_ttl), 0);
+    }
+
+    /// `reveal_ephemerals` flips the reveal flag on, and `tick_expire`
+    /// flips it back off once the reveal window passes.
+    #[test]
+    fn reveal_then_remask_after_window() {
+        let mut s = state();
+        s.push(ephemeral_msg(Instant::now()));
+        s.reveal_ephemerals();
+        let revealed = matches!(
+            &s.messages[0].ephemeral,
+            Some(e) if e.revealed_until.is_some(),
+        );
+        assert!(revealed, "reveal_ephemerals must set revealed_until");
+
+        // Force the reveal window into the past, then tick.
+        if let Some(e) = &mut s.messages[0].ephemeral {
+            e.revealed_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+        s.tick_expire_ephemerals();
+        let still_revealed = matches!(
+            &s.messages[0].ephemeral,
+            Some(e) if e.revealed_until.is_some(),
+        );
+        assert!(!still_revealed, "tick must clear an expired reveal flag");
     }
 }

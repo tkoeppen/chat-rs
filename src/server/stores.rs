@@ -178,6 +178,7 @@ mod tests {
                 username: "x".into(),
                 counter: 1,
                 timestamp_ms: 0,
+                ephemeral: false,
             },
             ciphertext: text.as_bytes().to_vec(),
         }

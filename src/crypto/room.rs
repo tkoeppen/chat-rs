@@ -49,6 +49,7 @@ mod tests {
             username: "alice".into(),
             counter: 1,
             timestamp_ms: 1000,
+            ephemeral: false,
         }
     }
 
