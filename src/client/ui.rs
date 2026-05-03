@@ -380,6 +380,7 @@ pub fn decrypt_to_display(room_key: &[u8; 32], m: &RoomMessage) -> DisplayMsg {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     fn state() -> UiState {
@@ -488,5 +489,22 @@ mod tests {
                 "{cmd} should send Clear"
             );
         }
+    }
+
+    /// Client-side replay defense: a malicious server that re-injects an
+    /// older `RoomMessage` should be ignored. Counters are tracked per
+    /// `(sender_user_id)` and must strictly increase.
+    #[test]
+    fn try_accept_counter_rejects_replay_per_sender() {
+        let mut s = state();
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        assert!(s.try_accept_counter(alice, 1));
+        assert!(s.try_accept_counter(alice, 2));
+        assert!(!s.try_accept_counter(alice, 2), "exact replay rejected");
+        assert!(!s.try_accept_counter(alice, 1), "out-of-order rejected");
+        assert!(s.try_accept_counter(alice, 3), "monotone advance allowed");
+        // Independent per sender — bob's counter is its own state.
+        assert!(s.try_accept_counter(bob, 1));
     }
 }

@@ -37,7 +37,7 @@ All configuration is read from environment variables. A `.env` file in the worki
 
 | Role | Choice | Crate |
 | --- | --- | --- |
-| Password stretching | Argon2id (m=64 MiB, t=3, p=1, len=32) | `argon2` |
+| Password stretching | Argon2id (m=64 MiB, t=4, p=1, len=32) | `argon2` |
 | Authenticated key exchange | Noise NNpsk0 — X25519 + ChaCha20-Poly1305 + BLAKE2s | `snow` |
 | Room-level AEAD | XChaCha20-Poly1305 (24-byte random nonce) | `chacha20poly1305` |
 | Master-key splitting (KDF) | Keyed BLAKE2s-256 (`Blake2sMac256`) | `blake2` |
@@ -51,7 +51,10 @@ Three phases: a plaintext room-select frame from the client, a plaintext server-
 
 **Phase 0a — Room select (plaintext, client → server):**
 
-`postcard(ClientFrame::RoomSelect { room: String })`. The room name is plaintext (server can't pick a PSK otherwise; room *names* are not secrets, passwords are). The server validates the name against `MAX_ROOM_ID_LEN`, looks up the room, and replies with either the room's hello (next phase) or `ServerFrame::Error { reason: AuthFailed }` for unknown rooms (deliberately indistinguishable from "wrong password later", so an attacker can't enumerate room names).
+`postcard(ClientFrame::RoomSelect { room: String })`. The room name is plaintext (server can't pick a PSK otherwise; room *names* are not secrets, passwords are). The server validates the name against `MAX_ROOM_ID_LEN`, looks up the room, and either:
+
+- on hit: replies with that room's `ServerFrame::Hello { room_salt, server_version }`;
+- on miss: synthesizes a junk `RoomState` (fresh random salt, fresh random PSK) and replies with that room's hello, then proceeds through `handshake_responder` exactly as for a real room. The handshake fails on the client's M1 verify — same wire shape as a wrong-password connect against a real room. An external observer cannot tell "no such room" from "wrong password," so room names are not enumerable.
 
 **Phase 0b — Server hello (plaintext, server → client):**
 
@@ -260,14 +263,19 @@ The Python references skip these; chat-rs enforces them:
 - **Argon2 cost on the server is paid once at startup**, not per connect — `ServerState` caches the derived `psk` and drops the password before listening.
 - **Handshake timeout (5 s)** on the unauthenticated phase (Noise M0/M1 + first encrypted Hello). Closes the slow-loris vector against tasks/FDs.
 - **Per-source-IP rate limit (60 connects / 60 s)** sliding window. Drops the socket without spawning a task. Sweeper periodically prunes the IP table.
-- **Salt bound into Noise prologue.** MITM tampering with the plaintext server-hello fails on M0 instead of after Argon2 work.
-- **Minimum password length: 8 chars** enforced in `cli::read_password` (env and prompt paths).
+- **Global concurrent-connection cap (4096)** via `AtomicUsize` + RAII guard on `ServerHub`. Bounds FD + outbox memory under a flood that defeats the per-IP limit (botnet, IPv6 /64).
+- **Per-session message-rate cap (30 / 10 s)** and **`/clear` cooldown (30 s)** in `UserSessionStore`. An authenticated client can no longer flood the broadcast path or wipe history at will.
+- **Per-message ciphertext cap (`MAX_CIPHERTEXT_LEN = 4096`)** so the worst-case `ServerFrame::Welcome { history }` (15 messages) fits inside `MAX_FRAME_LEN`. Without this, a busy room could lock new joiners out.
+- **Username charset:** ASCII `[A-Za-z0-9_-]{1,32}` enforced server-side. Blocks bidi/zero-width/control-char spoofing in the TUI.
+- **Salt + version bound into Noise prologue** (`(room_id, room_salt, server_version)`). MITM tampering with the plaintext server-hello — including version downgrade — fails on M0/M1 instead of after Argon2 work.
+- **Minimum password length: 12 chars** enforced in `cli::read_password` (env and prompt paths) and in `server::rooms::parse`. Counters offline brute-force against captured `room_salt`.
 - **Core dumps disabled** at startup via `setrlimit(RLIMIT_CORE, 0)` (Unix). A crash can't write key material to disk.
 - **Per-message AEAD AAD** binds `(from, username, counter, timestamp_ms)` so a malicious server can't relabel sender, change usernames, or replay messages without breaking decryption. Server enforces all three; clients enforce counter monotonicity client-side.
+- **Unknown-room indistinguishability:** server synthesizes a junk salt + junk PSK and runs the full handshake on a miss, so an unauthenticated probe can't enumerate room names by response shape.
 
 ## Testing
 
-**29 unit + 12 integration = 41 tests.**
+**30 unit + 17 integration = 47 tests.**
 
 - Unit (in-tree):
   - `crypto/password.rs` (4) — KDF determinism, password sensitivity, salt sensitivity, label separation.
@@ -277,8 +285,8 @@ The Python references skip these; chat-rs enforces them:
   - `server/ratelimit.rs` (3) — below-limit allowed, distinct IPs independent, cleanup drops empty.
   - `server/rooms.rs` (5) — parses two rooms with comments, rejects short password, rejects invalid name, rejects duplicate room, rejects empty config.
   - `proto.rs` (2) — postcard round-trip for every variant of `ClientFrame` and `ServerFrame`.
-  - `client/ui.rs` (7) — pinned-push keeps scroll 0, scrolled-push anchors view, `clear_messages` resets scroll, `HISTORY_CAP` evicts oldest, scroll clamps to max, `/q`+`/quit` exit, `/c`+`/clear` send Clear.
-- Integration (`tests/end_to_end.rs`, 12): two-client message exchange (asserts plaintext does not appear in broadcast bytes), wrong-password failure, history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, over-cap username rejected with `BadFrame`, duplicate `Hello` after auth drops connection, **rooms are isolated** (alice in alpha doesn't see bob's beta traffic), **unknown room rejected** with `AuthFailed`.
+  - `client/ui.rs` (8) — pinned-push keeps scroll 0, scrolled-push anchors view, `clear_messages` resets scroll, `HISTORY_CAP` evicts oldest, scroll clamps to max, `/q`+`/quit` exit, `/c`+`/clear` send Clear, `try_accept_counter` rejects per-sender replay.
+- Integration (`tests/end_to_end.rs`, 17): two-client message exchange (asserts plaintext does not appear in broadcast bytes), history replay for late joiner, history cap over wire, `/clear` propagation (incl. `Cleared.username`), oversized-frame rejection without OOM, unique `user_id` per connection, `ad.from` mismatch drops connection, **`ad.username` mismatch drops connection** (server-side relabel defense), **server rejects counter replay** (per-session monotonicity), over-cap username rejected with `BadFrame`, **invalid-charset username rejected** (bidi-override `\u{202E}`), duplicate `Hello` after auth drops connection, **rooms are isolated** (alice in alpha doesn't see bob's beta traffic), **unknown room indistinguishable from wrong password** (M-1 fake-hello — also covers wrong-password rejection), **oversized ciphertext rejected** (L-3), **message-rate cap enforced** (M-4), **`/clear` cooldown enforced** (L-2).
 - Pre-commit gate: `build.sh` runs `cargo fmt → cargo clippy --all-targets -- -D warnings → cargo test`.
 - Supply chain: `cargo deny check` (licenses + advisories + bans + sources).
 

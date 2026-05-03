@@ -11,6 +11,7 @@ pub mod stores;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -28,7 +29,8 @@ use crate::crypto::noise::{build_prologue, handshake_responder, recv_encrypted, 
 use crate::crypto::password::derive_keys;
 use crate::error::{Error, ErrorKind, Result};
 use crate::proto::{
-    ClientFrame, MAX_ROOM_ID_LEN, MAX_USERNAME_LEN, PROTOCOL_VERSION, RoomMessage, ServerFrame,
+    ClientFrame, MAX_CIPHERTEXT_LEN, MAX_ROOM_ID_LEN, MAX_USERNAME_LEN, PROTOCOL_VERSION,
+    RoomMessage, ServerFrame,
 };
 use crate::wire::{FramedStream, frame, recv_postcard, send_postcard};
 
@@ -46,11 +48,23 @@ const OUTBOX_DEPTH: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const RATELIMIT_MAX: usize = 60;
 const RATELIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// Hard ceiling on concurrent in-flight connections (handshaking + active).
+/// Bounds FD + per-conn outbox memory under a /64-IPv6 or botnet flood that
+/// the per-IP rate limit can't fully contain. Sized for ~16 GiB worst-case
+/// outbox (4096 × OUTBOX_DEPTH × MAX_FRAME_LEN), safely below typical FD
+/// soft limits.
+const MAX_ACTIVE_CONNS: usize = 4096;
 
 pub type RoomId = String;
 
 /// Per-room server state. One `Arc<RoomState>` per room, shared by every
 /// connection in that room.
+///
+/// **Lock order:** when more than one of the inner mutexes is held at the
+/// same time, always acquire in this order to prevent deadlock —
+/// `sessions → messages → connections`. Every site that grabs two
+/// (sweeper, `handle_connection` insert/cleanup, `handle_client_frame`)
+/// follows this order.
 pub struct RoomState {
     pub room_id: RoomId,
     pub room_salt: [u8; 32],
@@ -61,10 +75,52 @@ pub struct RoomState {
     pub connections: Mutex<ConnectionManager>,
 }
 
-/// Top-level server: a map of rooms + a global rate-limiter.
+impl RoomState {
+    fn new(room_id: RoomId, room_salt: [u8; 32], psk: Zeroizing<[u8; 32]>) -> Self {
+        Self {
+            room_id,
+            room_salt,
+            psk,
+            messages: Mutex::new(MessageStore::new()),
+            sessions: Mutex::new(UserSessionStore::new(SESSION_TIMEOUT)),
+            connections: Mutex::new(ConnectionManager::new()),
+        }
+    }
+}
+
+/// Top-level server: a map of rooms + a global rate-limiter + a live
+/// connection counter (capped by `MAX_ACTIVE_CONNS`).
 pub struct ServerHub {
     pub rooms: HashMap<RoomId, Arc<RoomState>>,
     pub ratelimit: RateLimiter,
+    pub active_conns: AtomicUsize,
+}
+
+/// RAII counter guard: increments `ServerHub::active_conns` on construction,
+/// decrements on drop. Returns `None` if the cap is already at `max`. Using a
+/// guard (rather than manual decrement) guarantees the counter reflects
+/// reality across every early-return path in `handle_connection`.
+struct ConnGuard {
+    hub: Arc<ServerHub>,
+}
+
+impl ConnGuard {
+    fn try_acquire(hub: Arc<ServerHub>, max: usize) -> Option<Self> {
+        // Optimistic add; roll back if we crossed the cap. Under contention
+        // this can transiently overshoot by `n_concurrent_attempts` then
+        // snap back, which is fine for a soft FD/memory ceiling.
+        if hub.active_conns.fetch_add(1, Ordering::AcqRel) >= max {
+            hub.active_conns.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self { hub })
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.hub.active_conns.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ServerHub {
@@ -82,20 +138,31 @@ impl ServerHub {
             // pw + keys (with room_key) drop here — both zeroized.
             rooms.insert(
                 cfg.name.clone(),
-                Arc::new(RoomState {
-                    room_id: cfg.name,
-                    room_salt: salt,
-                    psk,
-                    messages: Mutex::new(MessageStore::new()),
-                    sessions: Mutex::new(UserSessionStore::new(SESSION_TIMEOUT)),
-                    connections: Mutex::new(ConnectionManager::new()),
-                }),
+                Arc::new(RoomState::new(cfg.name, salt, psk)),
             );
         }
         Ok(Arc::new(Self {
             rooms,
             ratelimit: RateLimiter::new(RATELIMIT_MAX, RATELIMIT_WINDOW),
+            active_conns: AtomicUsize::new(0),
         }))
+    }
+
+    /// Synthesize a junk `RoomState` with a fresh random salt + random PSK,
+    /// for the unknown-room path. Lets `handle_connection` proceed through
+    /// `Hello + handshake_responder` so an external observer can't tell
+    /// "no such room" apart from "wrong password" — same wire pattern, same
+    /// failure mode (handshake rejects on the client's M1 verify).
+    fn fake_room(room_name: &str) -> Result<Arc<RoomState>> {
+        let mut salt = [0u8; 32];
+        let mut psk = [0u8; 32];
+        getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
+        getrandom::fill(&mut psk).map_err(|_| Error::Random)?;
+        Ok(Arc::new(RoomState::new(
+            room_name.to_string(),
+            salt,
+            Zeroizing::new(psk),
+        )))
     }
 }
 
@@ -183,6 +250,16 @@ async fn handle_connection(
     shutdown: CancellationToken,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
+
+    // Cap concurrent connections (M-3). Increment via RAII so every
+    // early-return path decrements correctly. Drop the socket immediately
+    // when over cap — no Hello, no slot held.
+    let Some(_conn_guard) = ConnGuard::try_acquire(hub.clone(), MAX_ACTIVE_CONNS) else {
+        warn!(%peer, "active-connection cap reached; dropping");
+        drop(sock);
+        return Err(Error::Protocol("active-connection cap"));
+    };
+
     let mut framed = frame(sock);
 
     // Phase 0a: read RoomSelect (plaintext) under the handshake timeout.
@@ -212,20 +289,18 @@ async fn handle_connection(
         .await;
         return Err(Error::Protocol("invalid room name length"));
     }
-    // Look up room. Reply with AuthFailed (not a more specific error) on miss
-    // so an attacker can't enumerate room names.
+    // Unknown-room path (M-1): synthesize a junk RoomState with random salt +
+    // random PSK and proceed exactly as for a real room. The handshake will
+    // fail at M1 verify on the client side — same wire shape as wrong-password
+    // against a real room, so an external observer cannot enumerate names.
+    // Treat the fake room exactly like a real one all the way through; any
+    // early-out would create a timing oracle (fake-room closes faster than
+    // wrong-password-against-real-room, which waits for the client EOF).
     let room = match hub.rooms.get(&room_name).cloned() {
         Some(r) => r,
         None => {
-            let _ = send_postcard(
-                &mut framed,
-                &ServerFrame::Error {
-                    reason: ErrorKind::AuthFailed,
-                },
-            )
-            .await;
-            warn!(%peer, room = %room_name, "unknown room");
-            return Err(Error::Protocol("unknown room"));
+            warn!(%peer, room = %room_name, "unknown room (sending fake hello)");
+            ServerHub::fake_room(&room_name)?
         }
     };
 
@@ -239,9 +314,9 @@ async fn handle_connection(
     )
     .await?;
 
-    // Phase 1: Noise NNpsk0 with prologue = (room_id, room_salt). Wrapped in
-    // a timeout to close the slow-loris vector.
-    let prologue = build_prologue(&room.room_id, &room.room_salt);
+    // Phase 1: Noise NNpsk0 with prologue = (room_id, room_salt, version).
+    // Wrapped in a timeout to close the slow-loris vector.
+    let prologue = build_prologue(&room.room_id, &room.room_salt, PROTOCOL_VERSION);
     let mut transport = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         handshake_responder(&room.psk, &prologue, &mut framed),
@@ -274,7 +349,10 @@ async fn handle_connection(
     };
     let username = match first {
         ClientFrame::Hello { username } => {
-            if username.is_empty() || username.len() > MAX_USERNAME_LEN {
+            if username.is_empty()
+                || username.len() > MAX_USERNAME_LEN
+                || !is_valid_username(&username)
+            {
                 let _ = send_encrypted(
                     &mut framed,
                     &mut transport,
@@ -283,7 +361,7 @@ async fn handle_connection(
                     },
                 )
                 .await;
-                return Err(Error::Protocol("invalid username length"));
+                return Err(Error::Protocol("invalid username"));
             }
             username
         }
@@ -400,10 +478,20 @@ async fn handle_client_frame(
             if ad.username != username {
                 return Err(Error::Protocol("ad.username does not match session"));
             }
+            // L-3: bound per-message ciphertext so a busy room with large
+            // messages can't push the next joiner's `Welcome` past
+            // MAX_FRAME_LEN. Includes the 24-byte nonce + 16-byte tag.
+            if ciphertext.len() > MAX_CIPHERTEXT_LEN {
+                return Err(Error::Protocol("ciphertext exceeds MAX_CIPHERTEXT_LEN"));
+            }
             {
                 let mut sessions = room.sessions.lock().await;
                 if !sessions.try_advance_counter(user_id, ad.counter) {
                     return Err(Error::Protocol("ad.counter not strictly increasing"));
+                }
+                // M-4: per-session message-rate cap.
+                if !sessions.try_consume_message_quota(user_id) {
+                    return Err(Error::Protocol("message rate exceeded"));
                 }
             }
             let room_msg = RoomMessage {
@@ -420,6 +508,13 @@ async fn handle_client_frame(
             Ok(())
         }
         ClientFrame::Clear => {
+            // L-2: cooldown on `/clear` (destructive + broadcast-amplified).
+            {
+                let mut sessions = room.sessions.lock().await;
+                if !sessions.try_consume_clear(user_id) {
+                    return Err(Error::Protocol("clear cooldown active"));
+                }
+            }
             {
                 let mut m = room.messages.lock().await;
                 m.clear();
@@ -435,6 +530,14 @@ async fn handle_client_frame(
             Ok(())
         }
     }
+}
+
+/// L-1: ASCII-only `[A-Za-z0-9_-]` for usernames. Same charset as room
+/// names. Blocks bidi-override / zero-width / control-char spoofing in the
+/// TUI without needing a full Unicode confusables table.
+fn is_valid_username(name: &str) -> bool {
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Broadcast a frame to all connected peers in this room. Uses `try_send` so a

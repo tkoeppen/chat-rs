@@ -51,9 +51,10 @@ pub async fn run(
 
     let keys = derive_keys(&password, &room_salt)?;
     drop(password);
-    // Prologue binds (room_id, room_salt): MITM tampering with the plaintext
-    // server-hello — or shuffling a client between rooms — fails on M0.
-    let prologue = build_prologue(&room, &room_salt);
+    // Prologue binds (room_id, room_salt, server_version): MITM tampering
+    // with the plaintext server-hello, version downgrade, or shuffling a
+    // client between rooms all fail at handshake M1 verify.
+    let prologue = build_prologue(&room, &room_salt, server_version);
     let mut transport = handshake_initiator(&keys.psk, &prologue, &mut framed).await?;
     let room_key = Zeroizing::new(keys.room_key);
     drop(keys);
@@ -111,8 +112,6 @@ where
         guard
             .term()
             .draw(|f: &mut Frame| ui::render(f, state))
-            // ^ render now takes &mut state to stash last_inner_h for paging
-            //   keys; the closure captures the outer &mut UiState.
             .map_err(Error::Io)?;
 
         tokio::select! {

@@ -91,6 +91,18 @@ Dropped vs the cmd-chat-derived design: `srp`, `fernet`, `serde_json`, `subtle` 
 - [x] Integration test: over-cap `Hello.username` is rejected with `ServerFrame::Error { reason: BadFrame }`
 - [x] Integration test: duplicate `Hello` after auth drops the connection
 - [x] Env-var-only CLI. All config (`CHAT_RS_BIND`, `CHAT_RS_ROOMS`, `CHAT_RS_SERVER`, `CHAT_RS_USERNAME`, `CHAT_RS_ROOM`, `CHAT_RS_PASSWORD`) lives in env; `dotenvy` auto-loads `.env` from cwd at startup; process env wins over file. Removed positional args (`<ip> <port> <username> <room>`) and the `--rooms-config` flag — the subcommand (`serve` / `connect`) is the only positional. New `Error::MissingEnv(&'static str)` for clear diagnostics. `.env.example` ships as a runnable local setup
+- [x] Pen-test hardening pass — closes 10 findings (M1–M4 + L1–L6):
+  - **M-1 unknown-room indistinguishability:** synthesize a junk `RoomState` (random salt + random PSK) on lookup miss and run the full handshake; client fails on M1 verify, identical wire shape to wrong-password
+  - **M-2 password floor:** `MIN_PW_LEN` 8 → 12 (cli + rooms parser); Argon2 `t` 3 → 4
+  - **M-3 connection cap:** `MAX_ACTIVE_CONNS = 4096` enforced via `AtomicUsize` + RAII `ConnGuard`
+  - **M-4 message-rate cap + L-2 clear cooldown:** sliding-window `MSG_RATE_MAX = 30 / 10s`; `CLEAR_COOLDOWN = 30s` per session, both in `UserSession`
+  - **L-1 username charset:** ASCII `[A-Za-z0-9_-]{1,32}` enforced server-side; blocks bidi/zero-width/control-char spoofing
+  - **L-3 ciphertext cap:** `MAX_CIPHERTEXT_LEN = 4096` so worst-case `Welcome` history fits in `MAX_FRAME_LEN`
+  - **L-4 ratelimit `expect()`:** replaced with fail-closed (deny on poisoned mutex)
+  - **L-5 prologue binds version:** `build_prologue` now takes `server_version`; closes the v2-downgrade vector
+  - **L-6 cwd .env risk:** documented in README operational notes
+  - 4 new e2e tests (`invalid_username_charset_rejected`, `oversized_ciphertext_rejected`, `message_rate_cap_enforced`, `clear_cooldown_enforced`) plus `unknown_room_rejected` rewritten as `unknown_room_indistinguishable_from_wrong_password`
+  - BREAKING: prologue change → wire-incompatible with prior builds; `MIN_PW_LEN` change → existing < 12-char passwords now rejected at startup
 - [ ] Remaining test gaps (require small refactors): (a) sweeper-driven idle eviction — would need an injectable timeout; (b) slow-peer broadcast — full-mpsc peer doesn't stall delivery to others; (c) graceful-shutdown drain — needs a programmatic shutdown handle on `server::run`
 - [ ] Memoize the Noise pattern parse — currently `crypto/noise.rs::params()` re-parses `"Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"` on every handshake and uses `.expect()` (the only `expect` in non-test code; infallible, but a `LazyLock<NoiseParams>` removes both the per-handshake work and the lone exception to the no-`expect` rule)
 

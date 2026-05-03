@@ -37,7 +37,10 @@ const ROOMS_ENV: &str = "CHAT_RS_ROOMS";
 const SERVER_ENV: &str = "CHAT_RS_SERVER";
 const USERNAME_ENV: &str = "CHAT_RS_USERNAME";
 const ROOM_ENV: &str = "CHAT_RS_ROOM";
-const MIN_PW_LEN: usize = 8;
+/// Floor on password length. 12 chars stops trivial dictionary brute-force
+/// against the captured `room_salt` even with a single GPU. Mirrored in
+/// `server/rooms.rs::MIN_PW_LEN`.
+const MIN_PW_LEN: usize = 12;
 
 fn require_env(key: &'static str) -> Result<String> {
     match env::var(key) {

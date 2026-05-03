@@ -7,7 +7,12 @@ use crate::error::{Error, Result};
 
 pub const KEY_LEN: usize = 32;
 const ARGON2_M_KIB: u32 = 64 * 1024;
-const ARGON2_T: u32 = 3;
+/// Iterations. Bumped from 3 → 4 to roughly 1.33× the per-guess cost for an
+/// offline attacker who has captured a `room_salt` (the salt is shipped in
+/// the plaintext server-hello, so anyone who can connect can grab it).
+/// Server-side cost is paid once at startup per room, so this is essentially
+/// free for the defender.
+const ARGON2_T: u32 = 4;
 const ARGON2_P: u32 = 1;
 
 const PSK_LABEL: &[u8] = b"chat-rs/v1/psk";
@@ -46,6 +51,7 @@ fn blake2s_kdf(master: &[u8], label: &[u8]) -> Result<[u8; KEY_LEN]> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]

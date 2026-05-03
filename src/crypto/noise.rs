@@ -7,13 +7,20 @@ use crate::wire::{FramedStream, recv_bytes, send_bytes};
 
 const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const NOISE_BUF: usize = 65535;
+/// Bytes that ChaCha20-Poly1305 (snow's AEAD here) appends to each
+/// transport message: a 16-byte authentication tag.
+const AEAD_TAG_LEN: usize = 16;
 
-/// Build the Noise prologue from `(room_id, room_salt)`. Length-prefixing the
-/// room id prevents an `id || salt` ambiguity (room "ab" + salt "cdef…" would
-/// otherwise hash the same as room "abcd" + salt "ef…"). Both sides MUST call
-/// this with the same inputs or the handshake fails on M0.
-pub fn build_prologue(room_id: &str, salt: &[u8; 32]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + room_id.len() + 32);
+/// Build the Noise prologue from `(room_id, room_salt, server_version)`.
+/// Length-prefixing the room id prevents an `id || salt` ambiguity (room
+/// `"ab"` concat salt `"cdef…"` would otherwise hash the same as room
+/// `"abcd"` concat salt `"ef…"`). Binding `server_version` closes the
+/// downgrade vector for any future v2 negotiation: tampering with the
+/// plaintext server-hello version causes the handshake to fail on M0/M1
+/// instead of being silently accepted. Both sides MUST call this with the
+/// same inputs.
+pub fn build_prologue(room_id: &str, salt: &[u8; 32], server_version: u16) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + room_id.len() + 32 + 2);
     debug_assert!(
         room_id.len() <= u8::MAX as usize,
         "room_id capped elsewhere"
@@ -21,9 +28,15 @@ pub fn build_prologue(room_id: &str, salt: &[u8; 32]) -> Vec<u8> {
     v.push(room_id.len() as u8);
     v.extend_from_slice(room_id.as_bytes());
     v.extend_from_slice(salt);
+    v.extend_from_slice(&server_version.to_be_bytes());
     v
 }
 
+/// `PATTERN` is a `'static` string we author and have unit-tested via
+/// `handshake_round_trip`; the parse is infallible. The lone `expect()` in
+/// non-test code, allow-listed explicitly so the project-wide
+/// `clippy::expect_used` ban stays in force everywhere else.
+#[allow(clippy::expect_used)]
 fn params() -> NoiseParams {
     PATTERN.parse().expect("static noise pattern")
 }
@@ -87,7 +100,7 @@ where
 }
 
 pub fn transport_seal(state: &mut TransportState, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; plaintext.len() + 64];
+    let mut buf = vec![0u8; plaintext.len() + AEAD_TAG_LEN];
     let n = state.write_message(plaintext, &mut buf)?;
     buf.truncate(n);
     Ok(buf)
@@ -129,6 +142,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::wire::frame;
     use tokio::io::duplex;

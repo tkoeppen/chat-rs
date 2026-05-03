@@ -39,6 +39,7 @@ pub fn open(room_key: &[u8; 32], ciphertext: &[u8], ad: &MessageAd) -> Result<Ve
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use uuid::Uuid;
 

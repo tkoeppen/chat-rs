@@ -12,6 +12,13 @@ pub const MAX_USERNAME_LEN: usize = 32;
 /// Bound on `ClientFrame::RoomSelect { room }`. Same rationale as
 /// MAX_USERNAME_LEN; also prevents oversized HashMap key churn server-side.
 pub const MAX_ROOM_ID_LEN: usize = 32;
+/// Bound on `ClientFrame::Message.ciphertext`. Sized so the worst-case
+/// `ServerFrame::Welcome { history: [HISTORY_LEN of these] }` still fits
+/// inside `MAX_FRAME_LEN` after Noise framing — otherwise a busy room with
+/// large messages would lock new joiners out (Welcome would exceed the
+/// 64 KiB frame cap). Includes the 24-byte XChaCha20-Poly1305 nonce + 16-byte
+/// tag, so plaintext payload tops out around 4 KiB.
+pub const MAX_CIPHERTEXT_LEN: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientFrame {
@@ -50,6 +57,13 @@ pub enum ServerFrame {
     },
 }
 
+/// Server-broadcast message frame. `from` and `username` are the *session*
+/// values the server enforced (and so the receiver can trust them for
+/// display). `ad.from` and `ad.username` carry the same fields a second
+/// time, but bound into the AEAD AAD — so the receiver also verifies them
+/// implicitly when `room::open` succeeds. The duplication is deliberate:
+/// outer fields are convenient (no need to inspect AAD to render), inner
+/// fields are authenticated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomMessage {
     pub from: Uuid,
@@ -80,6 +94,7 @@ pub fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     fn roundtrips<T: serde::Serialize + serde::de::DeserializeOwned>(v: &T) {

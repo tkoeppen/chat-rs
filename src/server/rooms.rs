@@ -17,7 +17,7 @@ use crate::proto::MAX_ROOM_ID_LEN;
 
 /// Same floor as `cli::MIN_PW_LEN`. Duplicated here so the rooms parser
 /// doesn't depend on `cli` (which would invert the module dependency).
-const MIN_PW_LEN: usize = 8;
+const MIN_PW_LEN: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct RoomConfig {
@@ -68,20 +68,21 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]
     fn parses_two_rooms_with_comments() {
         let text = "
             # dev environment
-            dev = changeme1
+            dev = changeme-12c
             # ops
             ops = anothersecret
         ";
         let r = parse(text).unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].name, "dev");
-        assert_eq!(r[0].password, "changeme1");
+        assert_eq!(r[0].password, "changeme-12c");
         assert_eq!(r[1].name, "ops");
     }
 
@@ -92,13 +93,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_name() {
-        assert!(parse("dev/ops=changeme1\n").is_err());
-        assert!(parse("=changeme1\n").is_err());
+        assert!(parse("dev/ops=changeme-12c\n").is_err());
+        assert!(parse("=changeme-12c\n").is_err());
     }
 
     #[test]
     fn rejects_duplicate_room() {
-        assert!(parse("dev=changeme1\ndev=changeme2\n").is_err());
+        assert!(parse("dev=changeme-12c\ndev=changeme-other\n").is_err());
     }
 
     #[test]

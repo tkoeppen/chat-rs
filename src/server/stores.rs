@@ -5,6 +5,16 @@ use uuid::Uuid;
 
 use crate::proto::{HISTORY_LEN, RoomMessage};
 
+/// Per-session message-send cap, sliding-window. Authenticated DoS guard:
+/// without this, one client at line rate triggers O(N) broadcast work per
+/// message across every other peer in the room.
+pub const MSG_RATE_MAX: usize = 30;
+pub const MSG_RATE_WINDOW: Duration = Duration::from_secs(10);
+/// Minimum gap between `/clear` operations from a single session. `/clear`
+/// is destructive and broadcast-amplified, so a short cooldown stops
+/// griefing without breaking legitimate use.
+pub const CLEAR_COOLDOWN: Duration = Duration::from_secs(30);
+
 pub struct MessageStore {
     history: VecDeque<RoomMessage>,
 }
@@ -45,6 +55,12 @@ pub struct UserSession {
     /// Highest accepted `MessageAd.counter` for this session. New messages
     /// must strictly exceed this to be accepted (replay protection).
     pub last_counter: u64,
+    /// Sliding window of recent `Message` send timestamps. Capped at
+    /// `MSG_RATE_MAX` per `MSG_RATE_WINDOW`.
+    pub message_window: VecDeque<Instant>,
+    /// When this session last issued `/clear`. Used to enforce
+    /// `CLEAR_COOLDOWN` on a destructive, broadcast-amplified op.
+    pub last_clear: Option<Instant>,
 }
 
 pub struct UserSessionStore {
@@ -68,6 +84,8 @@ impl UserSessionStore {
                 username,
                 last_active: Instant::now(),
                 last_counter: 0,
+                message_window: VecDeque::with_capacity(MSG_RATE_MAX),
+                last_clear: None,
             },
         );
     }
@@ -90,6 +108,45 @@ impl UserSessionStore {
         }
     }
 
+    /// Records a `Message` send for the given session. Returns true if it
+    /// fits inside the sliding window (`MSG_RATE_MAX` per `MSG_RATE_WINDOW`),
+    /// false if the cap is exceeded.
+    pub fn try_consume_message_quota(&mut self, user_id: Uuid) -> bool {
+        let Some(s) = self.sessions.get_mut(&user_id) else {
+            return false;
+        };
+        let now = Instant::now();
+        while s
+            .message_window
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > MSG_RATE_WINDOW)
+        {
+            s.message_window.pop_front();
+        }
+        if s.message_window.len() >= MSG_RATE_MAX {
+            return false;
+        }
+        s.message_window.push_back(now);
+        true
+    }
+
+    /// True if `/clear` is allowed for this session right now (first time
+    /// ever, or last clear was longer than `CLEAR_COOLDOWN` ago). Records
+    /// the new clear timestamp on success.
+    pub fn try_consume_clear(&mut self, user_id: Uuid) -> bool {
+        let Some(s) = self.sessions.get_mut(&user_id) else {
+            return false;
+        };
+        let now = Instant::now();
+        if let Some(prev) = s.last_clear
+            && now.duration_since(prev) < CLEAR_COOLDOWN
+        {
+            return false;
+        }
+        s.last_clear = Some(now);
+        true
+    }
+
     pub fn remove(&mut self, user_id: &Uuid) -> Option<UserSession> {
         self.sessions.remove(user_id)
     }
@@ -106,6 +163,7 @@ impl UserSessionStore {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::proto::MessageAd;
 

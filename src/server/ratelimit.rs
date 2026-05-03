@@ -26,8 +26,12 @@ impl RateLimiter {
 
     /// Records a connection from `ip`. Returns `true` if it's allowed,
     /// `false` if the limit for the current window has been exceeded.
+    /// Fail-closed on a poisoned mutex (deny rather than panic — keeps the
+    /// server reachable from network input rule).
     pub fn check(&self, ip: IpAddr) -> bool {
-        let mut map = self.by_ip.lock().expect("ratelimit mutex poisoned");
+        let Ok(mut map) = self.by_ip.lock() else {
+            return false;
+        };
         let entry = map.entry(ip).or_default();
         let now = Instant::now();
         while entry
@@ -44,9 +48,11 @@ impl RateLimiter {
     }
 
     /// Drop empty / fully-expired entries so a flood of distinct IPs can't
-    /// grow the map indefinitely.
+    /// grow the map indefinitely. Best-effort: silently skips on poison.
     pub fn cleanup(&self) {
-        let mut map = self.by_ip.lock().expect("ratelimit mutex poisoned");
+        let Ok(mut map) = self.by_ip.lock() else {
+            return;
+        };
         let now = Instant::now();
         map.retain(|_, q| {
             while q
@@ -62,6 +68,7 @@ impl RateLimiter {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::net::Ipv4Addr;
 
