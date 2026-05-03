@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Encrypted terminal chat. No persistence, no logs."
+repository = "https://github.com/tkoeppen/chat-rs"
 
 [[bin]]
 name = "chat-rs"

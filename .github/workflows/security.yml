@@ -1,0 +1,20 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.lock, Cargo.toml, deny.toml]
+  pull_request:
+    paths: [Cargo.lock, Cargo.toml, deny.toml]
+  schedule:
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources

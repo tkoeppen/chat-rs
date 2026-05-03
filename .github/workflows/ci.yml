@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Canonical gate: identical to the local `./build.sh` run (fmt --check,
+  # clippy with the project lint set, tests). Runs on Ubuntu only — the
+  # lint/format regime is OS-independent, so running it once is enough.
+  gate:
+    name: gate (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: bash build.sh
+
+  # Cross-platform smoke: confirm the codebase builds and tests pass on the
+  # other two CLAUDE.md targets. Skip lint/fmt — already covered by `gate`.
+  cross:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
